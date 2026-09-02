@@ -71,10 +71,6 @@
 
 ```
 aic2026/
-├── venv/                             # [Recommended Virtual Environment Location]
-│   ├── Scripts/ (or bin/ on Linux)
-│   └── Lib/site-packages/
-│
 ├── Data/                             # [Confidential Data Root - Ignored on Git]
 │   ├── aic_lancedb/                  # Embedded LanceDB table (~4.38 GB)
 │   ├── Custom_Keyframes/             # Extracted keyframe images for preview
@@ -82,6 +78,9 @@ aic2026/
 │
 ├── code/
 │   ├── local_retrieval/              # Core Search Engine & Model Encoders
+│   │   ├── venv/                     # ⭐ [Default Virtual Environment Location]
+│   │   │   ├── Scripts/ (or bin/ on Linux)
+│   │   │   └── Lib/site-packages/
 │   │   ├── config.py                 # Central configurations & environment loaders
 │   │   ├── search_engine.py          # Unified hybrid retrieval engine
 │   │   ├── qwen_reranker.py          # Qwen3-VL Reranking Engine
@@ -107,13 +106,14 @@ aic2026/
 
 ### 1. Clone & Environment Setup
 
-Create the Python virtual environment (Python >= 3.10) directly at the project root:
+Create the Python virtual environment (Python >= 3.10) inside `code/local_retrieval/venv/`:
 
 ```bash
 git clone https://github.com/liem-2006/aic2026.git
 cd aic2026
 
-# Create Virtual Environment at project root (venv/)
+# Create Virtual Environment inside code/local_retrieval/
+cd code/local_retrieval
 python -m venv venv
 
 # Activate Virtual Environment
@@ -123,8 +123,9 @@ python -m venv venv
 source venv/bin/activate
 
 # Install Dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+pip install -r ../../requirements.txt
+cd ../..
 ```
 
 ### 2. Configure Environment Variables
@@ -156,6 +157,7 @@ python verify_setup.py
 
 ### 5. Launch the Web Application (1-Click)
 
+From the project root `aic2026`:
 * **Windows**: Double-click `run_app.bat` or run:
   ```powershell
   .\run_app.bat

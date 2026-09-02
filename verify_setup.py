@@ -30,7 +30,16 @@ def main():
     data_dir = os.path.join(project_root, "Data")
     all_ok = True
 
-    # 1. KIỂM TRA PYTHON
+    # 1. KIỂM TRA MÔI TRƯỜNG VENV & PYTHON
+    venv_standard = os.path.join(project_root, "code", "local_retrieval", "venv")
+    venv_root = os.path.join(project_root, "venv")
+    if os.path.exists(venv_standard):
+        print_status("Vị trí Virtualenv", "OK", "code/local_retrieval/venv (Chuẩn)")
+    elif os.path.exists(venv_root):
+        print_status("Vị trí Virtualenv", "OK", "venv/ (Gốc)")
+    else:
+        print_status("Vị trí Virtualenv", "WARN", "Chưa tìm thấy venv tại code/local_retrieval/venv")
+
     py_version = sys.version.split()[0]
     if sys.version_info >= (3, 10):
         print_status("Phiên bản Python", "OK", f"Python {py_version}")

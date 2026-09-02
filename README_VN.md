@@ -33,10 +33,6 @@ Dưới đây là sơ đồ bố trí thư mục chuẩn trên máy sau khi cài
 
 ```
 2026-AIC/
-├── venv/                                    ← [VỊ TRÍ THƯ MỤC VIRTUALENV KHUYẾN NGHỊ]
-│   ├── Scripts/ (hoặc bin/ trên Linux)      ← Chứa python.exe và pip
-│   └── Lib/site-packages/                   ← Chứa toàn bộ thư viện cài đặt
-│
 ├── Data/                                    ← [THƯ MỤC CHỨA DỮ LIỆU - NHẬN TỪ TRƯỞNG NHÓM]
 │   ├── aic_lancedb/                         ← [QUAN TRỌNG NHẤT] Thư mục cơ sở dữ liệu Vector LanceDB (~4.38 GB)
 │   │   ├── _versions/
@@ -53,6 +49,9 @@ Dưới đây là sơ đồ bố trí thư mục chuẩn trên máy sau khi cài
 │
 ├── code/
 │   ├── local_retrieval/                     ← Engine tìm kiếm lõi (LanceDB, Qwen3-VL, Gemini, RT-DETR)
+│   │   ├── venv/                            ← ⭐ [VỊ TRÍ THƯ MỤC VIRTUALENV CHUẨN CỦA HỆ THỐNG]
+│   │   │   ├── Scripts/ (hoặc bin/ trên Linux)
+│   │   │   └── Lib/site-packages/
 │   │   ├── config.py                        ← Nạp đường dẫn và cấu hình .env
 │   │   ├── search_engine.py                 ← Lõi truy vấn Hybrid đa phương thức
 │   │   ├── qwen_reranker.py                 ← Reranker tinh chỉnh kết quả
@@ -71,10 +70,9 @@ Dưới đây là sơ đồ bố trí thư mục chuẩn trên máy sau khi cài
 └── requirements.txt                         ← Danh sách các thư viện Python cần cài đặt
 ```
 
-> **Ghi chú về vị trí `venv`**:  
-> Trình khởi động `run_app.bat` và `run_app.sh` được thiết kế thông minh tự động tìm kiếm `venv` ở cả 2 vị trí:
-> 1. `2026-AIC/venv/` (Khuyến nghị - chuẩn chung).
-> 2. `2026-AIC/code/local_retrieval/venv/` (Dành cho ai quen tạo venv bên trong code).
+> **⭐ Ghi chú quan trọng về `venv`**:  
+> Thư mục môi trường ảo Python của hệ thống được đặt tại: **`code/local_retrieval/venv/`**.  
+> File khởi động 1-click `run_app.bat` và `run_app.sh` sẽ tự động ưu tiên nhận diện `python.exe` tại thư mục này để chạy!
 
 ---
 
@@ -85,11 +83,11 @@ Dưới đây là sơ đồ bố trí thư mục chuẩn trên máy sau khi cài
 
 ```markdown
 Bạn là trợ lý lập trình phụ trách triển khai dự án AIC 2026. Hãy đọc kỹ file README_VN.md và thực hiện các bước sau:
-1. Tạo một môi trường ảo Virtualenv tại thư mục `venv/` (ngay tại thư mục gốc dự án) với Python >= 3.10.
-2. Kích hoạt `venv/` và cài đặt toàn bộ dependencies từ file `requirements.txt`.
+1. Tạo một môi trường ảo Virtualenv tại đúng đường dẫn: `code/local_retrieval/venv/` với Python >= 3.10.
+2. Kích hoạt môi trường `code/local_retrieval/venv/` và cài đặt toàn bộ dependencies từ file `requirements.txt`.
 3. Chạy script chẩn đoán `python verify_setup.py` để kiểm tra môi trường.
 4. Nếu chưa có file `.env`, hãy tự động sao chép `.env.example` thành `.env`.
-5. Khi kiểm tra đạt chuẩn, hãy khởi động FastAPI Server bằng lệnh `python code/web/backend/main.py` và thông báo cho tôi link truy cập `http://127.0.0.1:8000`.
+5. Khi kiểm tra đạt chuẩn, hãy khởi động FastAPI Server bằng file `run_app.bat` (hoặc `python code/web/backend/main.py`) và thông báo link truy cập `http://127.0.0.1:8000`.
 ```
 
 ---
@@ -102,12 +100,13 @@ git clone https://github.com/liem-2006/aic2026.git
 cd aic2026
 ```
 
-### Bước 2: Tạo môi trường ảo `venv` & Cài đặt thư viện
-Khuyến nghị sử dụng Python `3.10`, `3.11` hoặc `3.12`. Thư mục `venv` sẽ được tạo ngay tại thư mục gốc:
+### Bước 2: Tạo môi trường ảo `venv` tại `code/local_retrieval/venv/` & Cài đặt thư viện
+Khuyến nghị sử dụng Python `3.10`, `3.11` hoặc `3.12`:
 
 * **Trên Windows**:
   ```powershell
-  # 1. Tạo venv ngay tại thư mục gốc dự án
+  # 1. Chuyển vào thư mục local_retrieval để tạo venv chuẩn
+  cd code\local_retrieval
   python -m venv venv
 
   # 2. Kích hoạt môi trường venv
@@ -115,12 +114,16 @@ Khuyến nghị sử dụng Python `3.10`, `3.11` hoặc `3.12`. Thư mục `ven
 
   # 3. Nâng cấp pip và cài đặt dependencies
   python -m pip install --upgrade pip
-  pip install -r requirements.txt
+  pip install -r ..\..\requirements.txt
+
+  # 4. Quay lại thư mục gốc dự án
+  cd ..\..
   ```
 
 * **Trên Linux / macOS**:
   ```bash
-  # 1. Tạo venv ngay tại thư mục gốc dự án
+  # 1. Chuyển vào thư mục local_retrieval để tạo venv chuẩn
+  cd code/local_retrieval
   python3 -m venv venv
 
   # 2. Kích hoạt môi trường venv
@@ -128,7 +131,10 @@ Khuyến nghị sử dụng Python `3.10`, `3.11` hoặc `3.12`. Thư mục `ven
 
   # 3. Nâng cấp pip và cài đặt dependencies
   python -m pip install --upgrade pip
-  pip install -r requirements.txt
+  pip install -r ../../requirements.txt
+
+  # 4. Quay lại thư mục gốc dự án
+  cd ../..
   ```
 
 ### Bước 3: Đặt dữ liệu vào thư mục `Data/`
@@ -145,13 +151,14 @@ Khuyến nghị sử dụng Python `3.10`, `3.11` hoặc `3.12`. Thư mục `ven
    ```
 
 ### Bước 5: Kiểm tra sức khỏe môi trường (Health Check)
-Chạy script kiểm tra tự động:
+Chạy script kiểm tra tự động (với venv đã kích hoạt):
 ```bash
 python verify_setup.py
 ```
 Nếu màn hình báo xanh `[ĐẠT - OK]` ở các mục chính, hệ thống của bạn đã sẵn sàng $100\%$!
 
 ### Bước 6: Khởi động hệ thống (1-Click)
+Đứng tại thư mục gốc `2026-AIC`:
 * **Windows**: Nháy đúp chuột vào file **`run_app.bat`** (hoặc gõ `.\run_app.bat` trong Terminal).
 * **Linux / macOS**: Chạy lệnh **`bash run_app.sh`**.
 
