@@ -67,24 +67,32 @@
 
 ---
 
-## 📂 Repository Structure
+## 📂 Repository & Virtual Environment Structure
 
 ```
+aic2026/
+├── venv/                             # [Recommended Virtual Environment Location]
+│   ├── Scripts/ (or bin/ on Linux)
+│   └── Lib/site-packages/
+│
+├── Data/                             # [Confidential Data Root - Ignored on Git]
+│   ├── aic_lancedb/                  # Embedded LanceDB table (~4.38 GB)
+│   ├── Custom_Keyframes/             # Extracted keyframe images for preview
+│   └── video/                        # Original source MP4 videos
+│
 ├── code/
 │   ├── local_retrieval/              # Core Search Engine & Model Encoders
 │   │   ├── config.py                 # Central configurations & environment loaders
 │   │   ├── search_engine.py          # Unified hybrid retrieval engine
-│   │   ├── qwen_encoder.py           # Qwen3-VL embedding generation
+│   │   ├── qwen_reranker.py          # Qwen3-VL Reranking Engine
 │   │   ├── gemini_parser.py          # LLM Query decomposition & assistance
 │   │   └── asr_engine.py             # Whisper transcript matching
 │   └── web/
 │       ├── backend/                  # FastAPI REST API server (main.py)
 │       └── frontend/                 # Client UI (HTML5, Vanilla CSS, App.js)
 │
-├── Data/                             # [Local Data Root - Ignored on Git]
-│   ├── aic_lancedb/                  # Embedded LanceDB table (~4.38 GB)
-│   ├── Custom_Keyframes/             # Extracted keyframe images for preview
-│   └── video/                        # Original source MP4 videos
+├── query/
+│   └── submission_generator.py       # Official KIS submission formatting engine
 │
 ├── verify_setup.py                   # Automated system diagnostics script
 ├── run_app.bat                       # 1-Click launcher for Windows
@@ -99,11 +107,13 @@
 
 ### 1. Clone & Environment Setup
 
-```bash
-git clone <REPOSITORY_URL>
-cd 2026-AIC
+Create the Python virtual environment (Python >= 3.10) directly at the project root:
 
-# Create Virtual Environment (Python >= 3.10)
+```bash
+git clone https://github.com/liem-2006/aic2026.git
+cd aic2026
+
+# Create Virtual Environment at project root (venv/)
 python -m venv venv
 
 # Activate Virtual Environment
@@ -132,7 +142,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
 
 ### 3. Setup Data Assets
 
-Ensure the confidential datasets are placed in the `Data/` directory:
+Ensure the datasets obtained from team storage are placed in the `Data/` directory:
 * Vector Database: `Data/aic_lancedb/`
 * Image Previews: `Data/Custom_Keyframes/`
 
@@ -144,7 +154,7 @@ Run the diagnostic script to verify hardware and data integrity:
 python verify_setup.py
 ```
 
-### 5. Launch the Web Application
+### 5. Launch the Web Application (1-Click)
 
 * **Windows**: Double-click `run_app.bat` or run:
   ```powershell

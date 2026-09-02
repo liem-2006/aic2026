@@ -7,7 +7,7 @@
 
 ## 📌 MỤC LỤC
 1. [Tổng Quan Kiến Trúc](#-tổng-quan-kiến-trúc)
-2. [Cấu Trúc Dữ Liệu `Data/` (Tài Nguyên Cần Nhận Riêng)](#-cấu-trúc-dữ-liệu-data-tài-nguyên-cần-nhận-riêng)
+2. [Cấu Trúc Thư Mục Chuẩn (Vị Trí `venv` & `Data/`)](#-cấu-trúc-thư-mục-chuẩn-vị-trí-venv--data)
 3. [🤖 Hướng Dẫn Dành Cho AI Agent (Triển Khai Tự Động)](#-hướng-dẫn-dành-cho-ai-agent-triển-khai-tự-động)
 4. [🛠️ Hướng Dẫn Triển Khai Thủ Công (Từng Bước)](#️-hướng-dẫn-triển-khai-thủ-công-từng-bước)
 5. [🖥️ Tính Năng Trên Giao Diện Web](#️-tính-năng-trên-giao-diện-web)
@@ -26,14 +26,18 @@ Hệ thống kết hợp mô hình AI thị giác - ngôn ngữ tiên tiến nh�
 
 ---
 
-## 📂 CẤU TRÚC DỮ LIỆU `Data/` (TÀI NGUYÊN CẦN NHẬN RIÊNG)
+## 📂 CẤU TRÚC THƯ MỤC CHUẨN (VỊ TRÍ `venv` & `Data/`)
 
-Để đảm bảo bảo mật và tránh làm nặng kho mã nguồn GitHub, toàn bộ dữ liệu nặng và cơ sở dữ liệu **KHÔNG ĐƯA LÊN GITHUB**.  
-👉 **Đồng đội vui lòng liên hệ Trưởng nhóm để nhận file nén dữ liệu và giải nén vào thư mục `Data/` theo cấu trúc chuẩn sau:**
+Để đảm bảo bảo mật và tránh làm nặng kho mã nguồn GitHub, toàn bộ dữ liệu nặng và môi trường ảo **KHÔNG ĐƯA LÊN GITHUB**.  
+Dưới đây là sơ đồ bố trí thư mục chuẩn trên máy sau khi cài đặt:
 
 ```
 2026-AIC/
-├── Data/                                    ← [THƯ MỤC CHỨA DỮ LIỆU]
+├── venv/                                    ← [VỊ TRÍ THƯ MỤC VIRTUALENV KHUYẾN NGHỊ]
+│   ├── Scripts/ (hoặc bin/ trên Linux)      ← Chứa python.exe và pip
+│   └── Lib/site-packages/                   ← Chứa toàn bộ thư viện cài đặt
+│
+├── Data/                                    ← [THƯ MỤC CHỨA DỮ LIỆU - NHẬN TỪ TRƯỞNG NHÓM]
 │   ├── aic_lancedb/                         ← [QUAN TRỌNG NHẤT] Thư mục cơ sở dữ liệu Vector LanceDB (~4.38 GB)
 │   │   ├── _versions/
 │   │   └── keyframes.lance/                 ← Bảng dữ liệu chứa 358k vectors 2048D & nhãn COCO
@@ -49,9 +53,16 @@ Hệ thống kết hợp mô hình AI thị giác - ngôn ngữ tiên tiến nh�
 │
 ├── code/
 │   ├── local_retrieval/                     ← Engine tìm kiếm lõi (LanceDB, Qwen3-VL, Gemini, RT-DETR)
+│   │   ├── config.py                        ← Nạp đường dẫn và cấu hình .env
+│   │   ├── search_engine.py                 ← Lõi truy vấn Hybrid đa phương thức
+│   │   ├── qwen_reranker.py                 ← Reranker tinh chỉnh kết quả
+│   │   └── gemini_parser.py                 ← AI phân tích câu hỏi tự nhiên
 │   └── web/
 │       ├── backend/                         ← Server FastAPI (main.py)
 │       └── frontend/                        ← Giao diện Web Client (index.html, app.js, style.css)
+│
+├── query/
+│   └── submission_generator.py              ← Engine sinh file nộp bài chuẩn CSV/ZIP cho AIC
 │
 ├── .env                                     ← File biến môi trường chứa API Key (Tạo từ .env.example)
 ├── verify_setup.py                          ← Script chẩn đoán kiểm tra môi trường 1-click
@@ -60,19 +71,25 @@ Hệ thống kết hợp mô hình AI thị giác - ngôn ngữ tiên tiến nh�
 └── requirements.txt                         ← Danh sách các thư viện Python cần cài đặt
 ```
 
+> **Ghi chú về vị trí `venv`**:  
+> Trình khởi động `run_app.bat` và `run_app.sh` được thiết kế thông minh tự động tìm kiếm `venv` ở cả 2 vị trí:
+> 1. `2026-AIC/venv/` (Khuyến nghị - chuẩn chung).
+> 2. `2026-AIC/code/local_retrieval/venv/` (Dành cho ai quen tạo venv bên trong code).
+
 ---
 
 ## 🤖 HƯỚNG DẪN DÀNH CHO AI AGENT (TRIỂN KHAI TỰ ĐỘNG)
 
-> **Gợi ý dành cho đồng đội dùng AI Coding Assistant (Google Antigravity, Cursor, Claude Code, GitHub Copilot Workspace):**  
-> Hãy copy toàn bộ đoạn lệnh dưới đây và gửi thẳng vào khung chat của AI Agent:
+> **Gợi ý dành cho đồng đội dùng AI Coding Assistant (Google Antigravity, Cursor, Claude Code, GitHub Copilot):**  
+> Bạn chỉ cần copy toàn bộ khối lệnh dưới đây và dán thẳng vào khung chat của AI Agent:
 
 ```markdown
 Bạn là trợ lý lập trình phụ trách triển khai dự án AIC 2026. Hãy đọc kỹ file README_VN.md và thực hiện các bước sau:
-1. Kiểm tra môi trường Python (yêu cầu >= 3.10) và cài đặt dependencies từ `requirements.txt` vào một Virtualenv (venv).
-2. Chạy script `python verify_setup.py` để kiểm tra sức khỏe hệ thống.
-3. Nếu phát hiện thiếu file `.env`, hãy tự động tạo file `.env` từ `.env.example`.
-4. Nếu kiểm tra đạt chuẩn, hãy khởi động FastAPI Server bằng lệnh `python code/web/backend/main.py` và hướng dẫn tôi mở trình duyệt tại `http://127.0.0.1:8000`.
+1. Tạo một môi trường ảo Virtualenv tại thư mục `venv/` (ngay tại thư mục gốc dự án) với Python >= 3.10.
+2. Kích hoạt `venv/` và cài đặt toàn bộ dependencies từ file `requirements.txt`.
+3. Chạy script chẩn đoán `python verify_setup.py` để kiểm tra môi trường.
+4. Nếu chưa có file `.env`, hãy tự động sao chép `.env.example` thành `.env`.
+5. Khi kiểm tra đạt chuẩn, hãy khởi động FastAPI Server bằng lệnh `python code/web/backend/main.py` và thông báo cho tôi link truy cập `http://127.0.0.1:8000`.
 ```
 
 ---
@@ -81,26 +98,36 @@ Bạn là trợ lý lập trình phụ trách triển khai dự án AIC 2026. H�
 
 ### Bước 1: Clone mã nguồn về máy
 ```bash
-git clone <URL_REPO_GITHUB>
-cd 2026-AIC
+git clone https://github.com/liem-2006/aic2026.git
+cd aic2026
 ```
 
-### Bước 2: Tạo môi trường ảo Python & Cài đặt thư viện
-Khuyến nghị sử dụng Python `3.10`, `3.11` hoặc `3.12`:
+### Bước 2: Tạo môi trường ảo `venv` & Cài đặt thư viện
+Khuyến nghị sử dụng Python `3.10`, `3.11` hoặc `3.12`. Thư mục `venv` sẽ được tạo ngay tại thư mục gốc:
 
 * **Trên Windows**:
   ```powershell
+  # 1. Tạo venv ngay tại thư mục gốc dự án
   python -m venv venv
+
+  # 2. Kích hoạt môi trường venv
   .\venv\Scripts\activate
-  pip install --upgrade pip
+
+  # 3. Nâng cấp pip và cài đặt dependencies
+  python -m pip install --upgrade pip
   pip install -r requirements.txt
   ```
 
 * **Trên Linux / macOS**:
   ```bash
+  # 1. Tạo venv ngay tại thư mục gốc dự án
   python3 -m venv venv
+
+  # 2. Kích hoạt môi trường venv
   source venv/bin/activate
-  pip install --upgrade pip
+
+  # 3. Nâng cấp pip và cài đặt dependencies
+  python -m pip install --upgrade pip
   pip install -r requirements.txt
   ```
 
@@ -140,13 +167,14 @@ Trình duyệt sẽ tự động mở trang web tìm kiếm tại: **`http://127
 * 🚫 **Loại trừ nhanh Video (`🚫 Loại video này`)**: Nút bấm trực tiếp trên thẻ kết quả để làm mờ ngay các video không mong muốn và đồng bộ vào bộ lọc.
 * ⏱️ **Trục thời gian Video Timeline**: Xem toàn bộ phân cảnh xung quanh khung hình tìm thấy để xác định thời điểm nộp bài KIS.
 * 🏷️ **Thứ Hạng Thật (`#Rank`)**: Giữ nguyên vị trí xếp hạng gốc từ thuật toán khi áp dụng bộ lọc client-side.
+* 📝 **Nộp bài KIS tự động**: Nút nộp bài trực tiếp từ giao diện, tự động căn chỉnh khung hình theo thuật toán `submission_generator.py`.
 
 ---
 
 ## ❓ XỬ LÝ SỰ CỐ THƯỜNG GẶP (TROUBLESHOOTING)
 
 #### 1. Lỗi `DLL load failed while importing _lancedb`:
-* **Nguyên nhân**: Trên một số máy Windows có chính sách bảo mật (Application Control) hoặc thiếu thư viện C++ Redistributable.
+* **Nguyên nhân**: Trên một số máy Windows có chính sách bảo mật (Application Control) hoặc thiếu thư viện C++ Runtime.
 * **Khắc phục**: Cài đặt gói [Microsoft Visual C++ 2015-2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) rồi khởi động lại máy.
 
 #### 2. Máy không có card đồ họa NVIDIA (No GPU / CUDA):
