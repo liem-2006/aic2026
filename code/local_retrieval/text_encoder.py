@@ -5,6 +5,7 @@ Sử dụng Instruct Prefix ("Instruct: Given a search query, retrieve relevant 
 để kích hoạt đúng không gian vector Text-to-Image Contrastive Space 2048 dim.
 """
 import os
+import re
 import numpy as np
 from typing import Optional, List, Dict, Any, Union
 from sentence_transformers import SentenceTransformer
@@ -19,6 +20,83 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Tiền tố Task Instruction chính thức từ bài báo Qwen3-VL-Embedding
 OFFICIAL_INSTRUCT_PROMPT = "Instruct: Given a search query, retrieve relevant images\nQuery: "
+
+# ==============================================================================
+# CINEMATOGRAPHY & CAMERA MOTION DICTIONARY (CHIẾN LƯỢC 1: TỐI ƯU GÓC QUAY)
+# ==============================================================================
+CINEMATOGRAPHY_MAPPINGS = [
+    # Top-down / High angle / Aerial (Góc từ trên xuống, flycam, nhìn từ trên cao)
+    (
+        re.compile(r"(từ\s+trên\s+(xuống|cao)|nhìn\s+từ\s+trên|trên\s+nhìn\s+xuống|góc\s+(cao|trên|thẳng\s+đứng)|flycam|drone|trên\s+không|nóc\s+nhà|trần\s+nhà|từ\s+trên\s+đỉnh)", re.IGNORECASE),
+        "top-down view, bird's-eye view, high-angle overhead shot, aerial view, looking down from above"
+    ),
+    # Low angle / Worm's eye (Góc từ dưới lên, góc thấp, mặt đất)
+    (
+        re.compile(r"(từ\s+dưới\s+(lên|đất)|nhìn\s+từ\s+dưới|dưới\s+nhìn\s+lên|góc\s+thấp|ngang\s+mặt\s+đất|sát\s+đất)", re.IGNORECASE),
+        "low-angle shot, worm's-eye view, ground-level upward perspective, looking up"
+    ),
+    # Close-up / Macro (Cận cảnh, cực cận, phóng to)
+    (
+        re.compile(r"(cận\s+cảnh|cực\s+cận|phóng\s+to|quay\s+sát|nhìn\s+gần|chi\s+tiết\s+cận)", re.IGNORECASE),
+        "close-up shot, extreme close-up, macro shot, tight focal framing"
+    ),
+    # Wide angle / Panoramic (Toàn cảnh, góc rộng, từ xa)
+    (
+        re.compile(r"(toàn\s+cảnh|góc\s+rộng|từ\s+xa|nhìn\s+bao\s+quát|bao\s+quát)", re.IGNORECASE),
+        "wide-angle shot, extreme wide shot, panoramic view, landscape shot, long shot"
+    ),
+    # Panning (Lia máy ngang)
+    (
+        re.compile(r"(lia\s+máy|lia\s+(qua|sang|ngang)|quét\s+ngang)", re.IGNORECASE),
+        "panning shot, horizontal camera pan, camera panning across scene"
+    ),
+    # Tilting (Nghiêng máy lên / xuống)
+    (
+        re.compile(r"(nghiêng\s+máy|hất\s+máy|nghiêng\s+(lên|xuống))", re.IGNORECASE),
+        "tilting shot, vertical camera tilt, camera tilting up and down"
+    ),
+    # Tracking / Dolly (Máy quay bám theo đối tượng)
+    (
+        re.compile(r"(bám\s+theo|di\s+chuyển\s+theo|quay\s+theo|chạy\s+theo|máy\s+quay\s+đi\s+theo)", re.IGNORECASE),
+        "tracking shot, following camera movement, dolly shot, steadycam motion"
+    ),
+    # POV / First-person (Góc nhìn thứ nhất)
+    (
+        re.compile(r"(góc\s+nhìn\s+thứ\s+nhất|nhìn\s+qua\s+mắt|nhập\s+vai|chính\s+diện\s+mắt)", re.IGNORECASE),
+        "first-person point of view, POV shot, subjective camera perspective"
+    ),
+    # Over-the-shoulder (Góc nhìn qua vai)
+    (
+        re.compile(r"(qua\s+vai|nhìn\s+qua\s+vai|sau\s+vai|sau\s+lưng)", re.IGNORECASE),
+        "over-the-shoulder shot, OTS camera angle"
+    )
+]
+
+def enrich_cinematography_query(text: str) -> str:
+    """
+    Tự động nhận diện các cụm từ góc quay / chuyển động máy ảnh bằng tiếng Việt hoặc tiếng Anh
+    và bổ sung các anchor keywords điện ảnh chuẩn quốc tế vào text query,
+    tối ưu hóa độ tương đồng vector trong không gian Qwen3-VL 2048D.
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    enriched_additions = []
+    text_lower = text.lower()
+
+    for pattern, tags in CINEMATOGRAPHY_MAPPINGS:
+        if pattern.search(text_lower):
+            tag_parts = [t.strip() for t in tags.split(",")]
+            first_tag = tag_parts[0].lower()
+            if first_tag not in text_lower:
+                enriched_additions.append(tags)
+
+    if enriched_additions:
+        joined_tags = ", ".join(enriched_additions)
+        enriched_text = f"{text}, {joined_tags}"
+        return enriched_text
+
+    return text
 
 
 class TextEncoder:
@@ -38,12 +116,14 @@ class TextEncoder:
             self._model = SentenceTransformer(self.model_name, trust_remote_code=True)
             print(f"[TextEncoder] ✅ Nạp model thành công với Instruct Prefix chuẩn tác giả.")
 
-    def encode(self, text: str) -> np.ndarray:
+    def encode(self, text: str, enrich_cinematography: bool = True) -> np.ndarray:
         """
-        Nhận vào một chuỗi text query, áp dụng Instruct Prefix chuẩn tác giả Qwen,
-        trả về numpy array 1D shape (2048,) đã được L2-normalize.
+        Nhận vào một chuỗi text query, áp dụng tự động Cinematography Enrichment
+        và Instruct Prefix chuẩn tác giả Qwen, trả về numpy array 1D shape (2048,) đã L2-normalize.
         """
         self._load()
+        if enrich_cinematography:
+            text = enrich_cinematography_query(text)
         # Áp dụng chính xác Task Instruction Prefix của tác giả Qwen
         vec = self._model.encode(
             [text],
@@ -122,7 +202,7 @@ class TextEncoder:
             return self.encode(text_query)
 
         self._load()
-        txt = str(text_query).strip()
+        txt = enrich_cinematography_query(str(text_query).strip())
 
         # 1. Composed Vector từ 1 hoặc nhiều ảnh
         if isinstance(image_input, (list, tuple)):

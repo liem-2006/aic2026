@@ -199,6 +199,157 @@ const statusText = document.getElementById("status-text");
 const resultsGrid = document.getElementById("results-grid");
 const resultCount = document.getElementById("result-count");
 
+// Dual-Mode View Elements (Keyframe View vs Video Shot View)
+const btnViewKf = document.getElementById("btn-view-kf");
+const btnViewShot = document.getElementById("btn-view-shot");
+let currentViewMode = localStorage.getItem("aic_view_mode") || "shot";
+let currentShotResults = [];
+
+function updateViewModeButtons() {
+    if (currentViewMode === "shot") {
+        if (btnViewShot) {
+            btnViewShot.style.background = "#0284c7";
+            btnViewShot.style.color = "white";
+        }
+        if (btnViewKf) {
+            btnViewKf.style.background = "transparent";
+            btnViewKf.style.color = "#94a3b8";
+        }
+    } else {
+        if (btnViewKf) {
+            btnViewKf.style.background = "#3b82f6";
+            btnViewKf.style.color = "white";
+        }
+        if (btnViewShot) {
+            btnViewShot.style.background = "transparent";
+            btnViewShot.style.color = "#94a3b8";
+        }
+    }
+}
+updateViewModeButtons();
+
+// RRF Signal Selector Elements
+const rrfSignalVisual = document.getElementById("rrf-signal-visual");
+const rrfSignalAsr = document.getElementById("rrf-signal-asr");
+const rrfSignalShot = document.getElementById("rrf-signal-shot");
+
+if (rrfSignalVisual && localStorage.getItem("aic_rrf_visual") !== null) {
+    rrfSignalVisual.checked = localStorage.getItem("aic_rrf_visual") === "true";
+}
+if (rrfSignalAsr && localStorage.getItem("aic_rrf_asr") !== null) {
+    rrfSignalAsr.checked = localStorage.getItem("aic_rrf_asr") === "true";
+}
+if (rrfSignalShot && localStorage.getItem("aic_rrf_shot") !== null) {
+    rrfSignalShot.checked = localStorage.getItem("aic_rrf_shot") === "true";
+}
+
+[rrfSignalVisual, rrfSignalAsr, rrfSignalShot].forEach(el => {
+    if (el) {
+        el.addEventListener("change", () => {
+            if (rrfSignalVisual) localStorage.setItem("aic_rrf_visual", rrfSignalVisual.checked);
+            if (rrfSignalAsr) localStorage.setItem("aic_rrf_asr", rrfSignalAsr.checked);
+            if (rrfSignalShot) localStorage.setItem("aic_rrf_shot", rrfSignalShot.checked);
+            validateRrfSignals();
+        });
+    }
+});
+
+function validateRrfSignals() {
+    const v = rrfSignalVisual ? rrfSignalVisual.checked : true;
+    const a = rrfSignalAsr ? rrfSignalAsr.checked : true;
+    const s = rrfSignalShot ? rrfSignalShot.checked : true;
+    if (!v && !a && !s) {
+        showToast("⚠️ Vui lòng bật ít nhất 1 tín hiệu RRF (Visual / ASR / Shot)!", "warning");
+        if (searchBtn) searchBtn.disabled = true;
+    } else {
+        if (searchBtn) searchBtn.disabled = false;
+    }
+}
+
+function switchViewMode(mode) {
+    currentViewMode = mode;
+    localStorage.setItem("aic_view_mode", mode);
+    if (mode === "kf") {
+        if (btnViewKf) {
+            btnViewKf.style.background = "#3b82f6";
+            btnViewKf.style.color = "white";
+        }
+        if (btnViewShot) {
+            btnViewShot.style.background = "transparent";
+            btnViewShot.style.color = "#94a3b8";
+        }
+    } else {
+        if (btnViewShot) {
+            btnViewShot.style.background = "#0284c7";
+            btnViewShot.style.color = "white";
+        }
+        if (btnViewKf) {
+            btnViewKf.style.background = "transparent";
+            btnViewKf.style.color = "#94a3b8";
+        }
+    }
+
+    // NẾU ĐANG Ở CHẾ ĐỘ TRAKE: Chuyển đổi giữa Keyframe Storyboard vs Video Shot Storyboard
+    if (currentAppMode === "TRAKE") {
+        if (latestTrakeSequences && latestTrakeSequences.length > 0) {
+            if (resultCount) resultCount.innerText = `${latestTrakeSequences.length} sequences (TRAKE ${mode === 'kf' ? 'Keyframe' : 'Shot'} View)`;
+            renderTrakeStoryboard(latestTrakeSequences, mode);
+        }
+        return;
+    }
+
+    // NẾU ĐANG Ở CHẾ ĐỘ KIS / QA:
+    // CÙNG 1 DANH SÁCH TOP-K DUY NHẤT (Single Source of Truth), chỉ chuyển đổi cách hiển thị Video Shot vs Keyframe
+    if (currentResults && currentResults.length > 0) {
+        if (resultCount) resultCount.innerText = `${currentResults.length} kết quả Top-K (${mode === 'shot' ? '🎬 Video Shot' : '🖼️ Keyframe'} View)`;
+        renderResults(currentResults, mode);
+    }
+}
+
+if (btnViewKf) {
+    btnViewKf.addEventListener("click", () => switchViewMode("kf"));
+}
+if (btnViewShot) {
+    btnViewShot.addEventListener("click", () => switchViewMode("shot"));
+}
+
+// ==========================================================================
+// SMART STICKY HEADER (Tự động ẩn khi lướt xuống, hiện ngay khi kéo nhẹ lên)
+// ==========================================================================
+const mainContentEl = document.querySelector(".main-content");
+const resultsHeaderPro = document.querySelector(".results-header-pro");
+
+if (mainContentEl && resultsHeaderPro) {
+    let lastScrollTop = 0;
+    const SCROLL_DELTA_THRESHOLD = 8; // Ngưỡng 8px chống rung giật khi cuộn chậm
+
+    mainContentEl.addEventListener("scroll", () => {
+        const st = mainContentEl.scrollTop;
+
+        // Nếu ở gần đỉnh (<= 20px), luôn luôn giữ thanh hiển thị bình thường
+        if (st <= 20) {
+            resultsHeaderPro.classList.remove("header-hidden");
+            lastScrollTop = st;
+            return;
+        }
+
+        const diff = st - lastScrollTop;
+        if (Math.abs(diff) < SCROLL_DELTA_THRESHOLD) {
+            return;
+        }
+
+        if (diff > 0) {
+            // Lướt xuống (Scroll Down) -> Ẩn thanh header để giải phóng 100% không gian soi video
+            resultsHeaderPro.classList.add("header-hidden");
+        } else {
+            // Kéo nhẹ lên (Scroll Up) -> Trượt xuống ngay tức thì để người dùng đổi chế độ/xem Top-K
+            resultsHeaderPro.classList.remove("header-hidden");
+        }
+
+        lastScrollTop = st;
+    }, { passive: true });
+}
+
 // Lightbox Elements
 const lightboxModal = document.getElementById("lightbox-modal");
 const lightboxCloseBtn = document.getElementById("lightbox-close-btn");
@@ -214,6 +365,23 @@ const lightboxVideoBtn = document.getElementById("lightbox-video-btn");
 const copyStatus = document.getElementById("copy-status");
 const lightboxTranscript = document.getElementById("lightbox-transcript");
 const lightboxBoxesList = document.getElementById("lightbox-boxes-list");
+
+// Lightbox Video Shot Elements
+const lightboxMediaSwitcher = document.getElementById("lightbox-media-switcher");
+const btnLightboxModeShot = document.getElementById("btn-lightbox-mode-shot");
+const btnLightboxModeKf = document.getElementById("btn-lightbox-mode-kf");
+const lightboxShotBox = document.getElementById("lightbox-shot-box");
+const lightboxShotVideo = document.getElementById("lightbox-shot-video");
+const lightboxCanvasControls = document.getElementById("lightbox-canvas-controls");
+const lightboxShotControls = document.getElementById("lightbox-shot-controls");
+let currentLightboxMediaMode = "shot";
+
+if (btnLightboxModeShot) {
+    btnLightboxModeShot.addEventListener("click", () => setLightboxMediaMode("shot"));
+}
+if (btnLightboxModeKf) {
+    btnLightboxModeKf.addEventListener("click", () => setLightboxMediaMode("kf"));
+}
 
 // Timeline Elements
 const timelineModal = document.getElementById("timeline-modal");
@@ -283,9 +451,9 @@ function switchMode(mode, saveState = true) {
             resultsMainTitle.innerText = "⏱️ TRAKE STORYBOARD MATRIX (TARS MONOTONIC DP)";
         }
 
-        // Nếu đã có kết quả TRAKE trước đó -> Render lại Storyboard Matrix
+        // Nếu đã có kết quả TRAKE trước đó -> Render lại Storyboard Matrix theo view mode hiện tại
         if (latestTrakeSequences && latestTrakeSequences.length > 0) {
-            renderTrakeStoryboard(latestTrakeSequences);
+            renderTrakeStoryboard(latestTrakeSequences, currentViewMode);
         }
 
         showToast("⏱️ Đã chuyển sang chế độ TRAKE (Temporal Event Extraction)!", "info", 2000);
@@ -304,9 +472,9 @@ function switchMode(mode, saveState = true) {
             resultsMainTitle.innerText = "MULTIMODAL RESULTS";
         }
 
-        // Render lại kết quả KIS nếu có
+        // Render lại kết quả KIS nếu có theo view mode hiện tại
         if (currentResults && currentResults.length > 0) {
-            renderResults(currentResults);
+            renderResults(currentResults, currentViewMode);
         }
 
         showToast("🔍 Đã chuyển về chế độ KIS / QA thông thường.", "info", 1800);
@@ -1365,7 +1533,12 @@ async function performMultiSceneSearch() {
                 k_per_video: mFramesVal,
                 use_rrf: isRrf,
                 rrf_k: rrfK,
-                asr_window_n: selectedAsrWindowN
+                asr_window_n: selectedAsrWindowN,
+                rrf_use_visual: rrfSignalVisual ? rrfSignalVisual.checked : true,
+                rrf_use_asr: rrfSignalAsr ? rrfSignalAsr.checked : true,
+                rrf_use_shot: rrfSignalShot ? rrfSignalShot.checked : true,
+                exclude_videos: currentExcludeTags.length > 0 ? currentExcludeTags : null,
+                return_shots: true
             })
         });
 
@@ -1404,7 +1577,7 @@ async function performMultiSceneSearch() {
 // ==========================================================================
 // RENDER TRAKE STORYBOARD MATRIX (TARS MONOTONIC DP RESULTS)
 // ==========================================================================
-function renderTrakeStoryboard(storyboardSequences) {
+function renderTrakeStoryboard(storyboardSequences, viewMode = currentViewMode) {
     if (!resultsGrid) return;
     resultsGrid.classList.add("trake-mode-grid");
     resultsGrid.innerHTML = "";
@@ -1421,12 +1594,17 @@ function renderTrakeStoryboard(storyboardSequences) {
         return;
     }
 
+    const isShotMode = (viewMode === "shot");
+
     const wrapper = document.createElement("div");
     wrapper.className = "trake-results-wrapper";
 
     storyboardSequences.forEach((seq) => {
         const groupCard = document.createElement("div");
-        groupCard.className = "trake-group-card";
+        const vidUpper = (seq.video_id || "").toUpperCase();
+        const isExcluded = currentExcludeTags.includes(vidUpper);
+        groupCard.className = isExcluded ? "trake-group-card card-excluded" : "trake-group-card";
+        groupCard.dataset.videoId = seq.video_id || "";
 
         const chronoBadge = seq.is_chronological
             ? `<span class="storyboard-chrono-badge">⏱️ Chuẩn Tuần Tự (t₁ < t₂ < ...)</span>`
@@ -1465,22 +1643,29 @@ function renderTrakeStoryboard(storyboardSequences) {
             }
 
             const eventLabel = sc.scene_name ? (sc.scene_name.includes(":") ? sc.scene_name.split(":")[0] : `E${scIdx + 1}`) : `E${scIdx + 1}`;
+            const hasCutVideo = isShotMode && !!sc.video_url;
+            const shotBadge = (isShotMode && sc.shot_id)
+                ? `<span class="sb-shot-badge" style="background: rgba(14, 165, 233, 0.2); border: 1px solid rgba(14, 165, 233, 0.4); color: #38bdf8; padding: 1px 5px; border-radius: 3px; font-size: 0.65rem; font-family: var(--font-mono); font-weight: 600;">🎬 #${sc.shot_index || 1} (${sc.shot_duration_sec || 0}s)</span>`
+                : "";
 
             scenesHtml += `
                 <div class="storyboard-scene-card" data-vid="${sc.video_id}" data-fid="${sc.frame_id}">
                     <span class="trake-event-tag">${eventLabel}</span>
-                    <div class="storyboard-thumb-wrapper" title="🔍 Bấm để xem chi tiết / Bounding Box">
-                        <img src="${sc.image_url}" loading="lazy" alt="Frame ${sc.frame_id}">
+                    <div class="storyboard-thumb-wrapper" title="${isShotMode ? '🔍 Click phóng to / Rê chuột xem video shot' : '🔍 Bấm để xem chi tiết / Bounding Box'}" style="position: relative; overflow: hidden; cursor: pointer; height: 130px; background: #000;">
+                        <img src="${sc.image_url}" loading="lazy" alt="Frame ${sc.frame_id}" class="sb-thumb-img" style="width: 100%; height: 100%; object-fit: cover; display: block;">
+                        ${hasCutVideo ? `<video src="${sc.video_url}" loop muted playsinline preload="none" class="sb-video-player" style="display: none; width: 100%; height: 100%; object-fit: cover;"></video>` : ""}
                         <span class="card-score-pill">${scoreVal}</span>
+                        ${hasCutVideo ? `<span class="sb-hover-hint" style="position: absolute; bottom: 4px; right: 4px; background: rgba(0,0,0,0.75); font-size: 0.60rem; color: #38bdf8; padding: 1px 5px; border-radius: 3px; pointer-events: none;">▶ Shot</span>` : ""}
                     </div>
                     <div class="storyboard-meta-bar">
-                        <div class="storyboard-info-row">
-                            <span style="font-weight: 700; color: #38bdf8;">⏱️ ${timeStr} (${timeSec}s)</span>
-                            <span style="color: var(--text-dim); font-weight: 700;">F:${sc.frame_id}</span>
+                        <div class="storyboard-info-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
+                            <span style="font-weight: 700; color: #38bdf8; font-size: 0.72rem;">⏱️ ${timeStr}</span>
+                            <span style="color: var(--text-dim); font-weight: 700; font-size: 0.70rem;">F:${sc.frame_id}</span>
                         </div>
+                        ${shotBadge ? `<div style="margin-bottom: 4px; display: flex; align-items: center; gap: 4px;">${shotBadge}</div>` : ""}
                         <div class="storyboard-actions-row">
-                            <button class="btn-card-action btn-sb-video" title="Xem video tại giây này">▶️ Video</button>
-                            <button class="btn-card-action btn-sb-copy" title="Copy Frame ID">📋 Copy ID</button>
+                            <button class="btn-card-action btn-sb-video" title="${isShotMode ? 'Phát video shot phân cảnh' : 'Xem video tại giây này'}">${isShotMode && hasCutVideo ? '🎬 Phát' : '▶️ Video'}</button>
+                            <button class="btn-card-action btn-sb-copy" title="Copy Frame ID">📋 Copy</button>
                         </div>
                     </div>
                 </div>
@@ -1501,6 +1686,9 @@ function renderTrakeStoryboard(storyboardSequences) {
                     <code class="trake-sub-code">${seq.submission_line}</code>
                     <button class="btn-card-action btn-copy-trake-line" data-line="${seq.submission_line}">📋 Copy Line</button>
                     <button class="btn-card-action btn-sb-timeline-all" data-vid="${seq.video_id}">🎞️ Timeline</button>
+                    <button class="btn-sb-exclude ${isExcluded ? 'is-excluded' : ''}" data-vid="${seq.video_id}" title="Loại trừ / hoàn tác loại trừ video này khỏi TRAKE">
+                        ${isExcluded ? '🔴 Đã loại • Bỏ loại' : '🚫 Loại video'}
+                    </button>
                 </div>
             </div>
             <div class="storyboard-sequence-row">
@@ -1512,6 +1700,27 @@ function renderTrakeStoryboard(storyboardSequences) {
         groupCard.querySelectorAll(".storyboard-scene-card").forEach((scCard, idx) => {
             const scData = seq.scenes[idx];
             const imgBox = scCard.querySelector(".storyboard-thumb-wrapper");
+            const thumbImg = scCard.querySelector(".sb-thumb-img");
+            const videoEl = scCard.querySelector(".sb-video-player");
+            const hoverHint = scCard.querySelector(".sb-hover-hint");
+
+            // Hover phát video phân cảnh con chỉ khi ở chế độ Shot
+            if (isShotMode && imgBox && videoEl) {
+                imgBox.addEventListener("mouseenter", () => {
+                    if (thumbImg) thumbImg.style.display = "none";
+                    videoEl.style.display = "block";
+                    if (hoverHint) hoverHint.style.display = "none";
+                    videoEl.play().catch(e => console.warn("Hover play shot:", e));
+                });
+                imgBox.addEventListener("mouseleave", () => {
+                    videoEl.pause();
+                    videoEl.currentTime = 0;
+                    videoEl.style.display = "none";
+                    if (thumbImg) thumbImg.style.display = "block";
+                    if (hoverHint) hoverHint.style.display = "block";
+                });
+            }
+
             if (imgBox) {
                 imgBox.addEventListener("click", () => {
                     openLightbox(0, [scData]);
@@ -1521,7 +1730,17 @@ function renderTrakeStoryboard(storyboardSequences) {
             const vidBtn = scCard.querySelector(".btn-sb-video");
             if (vidBtn) {
                 vidBtn.addEventListener("click", () => {
-                    openVideoPlayer(scData.video_id, scData.frame_id, scData.timestamp_sec);
+                    if (isShotMode && videoEl) {
+                        if (videoEl.paused) {
+                            if (thumbImg) thumbImg.style.display = "none";
+                            videoEl.style.display = "block";
+                            videoEl.play();
+                        } else {
+                            videoEl.pause();
+                        }
+                    } else {
+                        openVideoPlayer(scData.video_id, scData.frame_id, scData.timestamp_sec);
+                    }
                 });
             }
 
@@ -1532,7 +1751,7 @@ function renderTrakeStoryboard(storyboardSequences) {
                     navigator.clipboard.writeText(text).then(() => {
                         copyBtn.innerText = "✅ ĐÃ COPY!";
                         showToast(`📋 Đã sao chép: ${text}`, "success", 1800);
-                        setTimeout(() => { copyBtn.innerText = "📋 Copy ID"; }, 1500);
+                        setTimeout(() => { copyBtn.innerText = "📋 Copy"; }, 1500);
                     });
                 });
             }
@@ -1557,6 +1776,25 @@ function renderTrakeStoryboard(storyboardSequences) {
             tlAllBtn.addEventListener("click", () => {
                 const firstFrame = seq.scenes[0] ? seq.scenes[0].frame_id : null;
                 openTimeline(seq.video_id, firstFrame);
+            });
+        }
+
+        // Nút Quick-Exclude cho TRAKE Video Group
+        const excludeBtn = groupCard.querySelector(".btn-sb-exclude");
+        if (excludeBtn) {
+            excludeBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const vUpper = (seq.video_id || "").toUpperCase();
+                const eIdx = currentExcludeTags.indexOf(vUpper);
+                if (eIdx === -1) {
+                    currentExcludeTags.push(vUpper);
+                    showToast(`🚫 Đã loại trừ video ${seq.video_id} khỏi TRAKE`, "warning", 2000);
+                } else {
+                    currentExcludeTags.splice(eIdx, 1);
+                    showToast(`✅ Đã bỏ loại trừ video ${seq.video_id}`, "success", 2000);
+                }
+                renderExcludeTags();
+                applyExcludeStateToGrid();
             });
         }
 
@@ -1613,7 +1851,7 @@ async function performQwenRerankChains() {
 
         if (data.storyboard_sequences && data.storyboard_sequences.length > 0) {
             latestTrakeSequences = data.storyboard_sequences;
-            renderTrakeStoryboard(latestTrakeSequences);
+            renderTrakeStoryboard(latestTrakeSequences, currentViewMode);
             if (qwenProgressText) qwenProgressText.innerText = `✅ Đã chấm ${data.total_evaluated} chuỗi (${elapsed}s)`;
             statusText.innerText = `🤖 QWEN RERANK HOÀN TẤT: Đã tái xếp hạng ${data.total_evaluated} chuỗi TRAKE trong ${elapsed}s!`;
             showToast(`✅ Qwen-VL đã tái xếp hạng thành công ${data.total_evaluated} chuỗi (${elapsed}s)!`, "success");
@@ -1719,7 +1957,12 @@ async function performTrakeSearch() {
                 alpha_fusion: 0.35,
                 k_paths: kPathsVal,
                 trake_top_k: topKSeqVal,
-                asr_window_n: selectedAsrWindowN
+                asr_window_n: selectedAsrWindowN,
+                rrf_use_visual: rrfSignalVisual ? rrfSignalVisual.checked : true,
+                rrf_use_asr: rrfSignalAsr ? rrfSignalAsr.checked : true,
+                rrf_use_shot: rrfSignalShot ? rrfSignalShot.checked : true,
+                exclude_videos: currentExcludeTags.length > 0 ? currentExcludeTags : null,
+                return_shots: true
             })
         });
 
@@ -1738,7 +1981,7 @@ async function performTrakeSearch() {
         statusText.innerText = `⏱️ TRAKE: TARS DP hoàn tất trong ${elapsedSec}s! Tìm thấy ${latestTrakeSequences.length} chuỗi tuần tự từ Top ${data.top_videos ? data.top_videos.length : 0} Video.`;
         showToast(`✅ Đã tìm thấy ${latestTrakeSequences.length} chuỗi TRAKE tối ưu (${elapsedSec}s)!`, "success");
 
-        renderTrakeStoryboard(latestTrakeSequences);
+        renderTrakeStoryboard(latestTrakeSequences, currentViewMode);
 
     } catch (err) {
         dismissLoadingToast();
@@ -1868,7 +2111,11 @@ async function performSearch() {
         top_k: parseInt(topKNum ? topKNum.value : 60) || 60,
         use_rrf: isRrf,
         rrf_k: rrfK,
-        asr_window_n: selectedAsrWindowN
+        asr_window_n: selectedAsrWindowN,
+        rrf_use_visual: rrfSignalVisual ? rrfSignalVisual.checked : true,
+        rrf_use_asr: rrfSignalAsr ? rrfSignalAsr.checked : true,
+        rrf_use_shot: rrfSignalShot ? rrfSignalShot.checked : true,
+        return_shots: true
     };
 
     const t0 = performance.now();
@@ -1887,17 +2134,17 @@ async function performSearch() {
         const data = await response.json();
         dismissLoadingToast();
         currentResults = data.results || [];
+        currentShotResults = data.shot_results || [];
         currentResults.forEach((r, i) => {
             r.original_rank = i + 1;
         });
-        activeResultsSource = currentResults;
         const elapsedMs = ((performance.now() - t0) / 1000).toFixed(2);
+        activeResultsSource = currentResults;
+        resultCount.innerText = `${currentResults.length} kết quả Top-K (${currentViewMode === 'shot' ? '🎬 Video Shot' : '🖼️ Keyframe'} View)`;
+        renderResults(currentResults, currentViewMode);
 
-        resultCount.innerText = `${currentResults.length} items found`;
-        statusText.innerText = `✅ Xong: ${currentResults.length} frames (${elapsedMs}s)`;
-        showToast(`✅ Đã tìm thấy ${currentResults.length} frames (${elapsedMs}s)!`, "success");
-
-        renderResults(currentResults);
+        statusText.innerText = `✅ Xong: ${currentResults.length} Top-K (${elapsedMs}s)`;
+        showToast(`✅ Đã tìm thấy ${currentResults.length} kết quả Top-K (${elapsedMs}s)!`, "success");
 
     } catch (err) {
         dismissLoadingToast();
@@ -2071,40 +2318,61 @@ if (rerankBtn) {
 }
 
 // ==========================================================================
-// RENDER KẾT QUẢ TÌM KIẾM THEO CHUẨN LINEAR PRO MINIMALIST
+// RENDER KẾT QUẢ TÌM KIẾM THỐNG NHẤT (UNIFIED TOP-K PRESENTATION)
+// Áp dụng chung một thuật toán xếp hạng RRF, hỗ trợ 2 góc nhìn:
+// 1. "shot" (Mặc định): Chiếu Video Shot (.mp4 clip tự lặp, hover phát, click Lightbox)
+// 2. "kf": Chiếu Keyframe đại diện tĩnh
+// Thứ tự Top-K (#1, #2, #3...) được bảo toàn 100% khi chuyển đổi góc nhìn!
 // ==========================================================================
-function renderResults(results) {
+function renderResults(results, displayMode = currentViewMode) {
     if (!resultsGrid) return;
     resultsGrid.classList.remove("trake-mode-grid");
-    resultsGrid.innerHTML = ""; // Xóa sạch kết quả cũ trước khi vẽ mới
+    resultsGrid.innerHTML = "";
 
-    if (results.length === 0) {
-        resultsGrid.innerHTML = `<div style="grid-column: 1/-1; padding: 40px; text-align: center; color: var(--text-dim); font-size: 0.9rem;">Không tìm thấy keyframe nào thỏa mãn bộ lọc.</div>`;
+    if (!results || results.length === 0) {
+        resultsGrid.innerHTML = `<div style="grid-column: 1/-1; padding: 40px; text-align: center; color: var(--text-dim); font-size: 0.9rem;">Không tìm thấy kết quả nào thỏa mãn bộ lọc.</div>`;
         return;
     }
+
+    const isShotMode = (displayMode === "shot");
 
     results.forEach((res, idx) => {
         const card = document.createElement("div");
         const isExcluded = currentExcludeTags.includes((res.video_id || "").toUpperCase());
         card.className = isExcluded ? "result-card card-excluded" : "result-card";
+        if (isShotMode) card.classList.add("shot-card");
         card.dataset.videoId = res.video_id || "";
+        if (res.shot_id) card.dataset.shotId = res.shot_id;
 
+        const rankNum = res.original_rank !== undefined ? res.original_rank : (idx + 1);
         const scoreFinal = (res.score !== undefined && res.score !== null) ? Number(res.score).toFixed(4) : "0.0000";
         const scoreVis = (res.visual_score !== undefined && res.visual_score !== null) ? Number(res.visual_score).toFixed(4) : "0.0000";
-        const scoreOcr = (res.ocr_score !== undefined && res.ocr_score !== null) ? Number(res.ocr_score).toFixed(4) : "0.0000";
         const scoreAsr = (res.asr_score !== undefined && res.asr_score !== null) ? Number(res.asr_score).toFixed(4) : "0.0000";
+        const scoreOcr = (res.ocr_score !== undefined && res.ocr_score !== null) ? Number(res.ocr_score).toFixed(4) : "0.0000";
         const scoreObj = (res.obj_score !== undefined && res.obj_score !== null) ? Number(res.obj_score).toFixed(4) : "0.0000";
 
-        // Mốc thời gian
+        // Xử lý frame_id
+        let bestFid = res.best_kf_frame_id || res.anchor_frame_id || res.frame_id || "";
+        if (typeof bestFid === "number") bestFid = String(bestFid).padStart(6, "0");
+
+        // Xử lý mốc thời gian
         let timeStr = "";
-        if (res.timestamp_sec !== undefined && res.timestamp_sec !== null) {
+        let timeRangeStr = "";
+        if (res.shot_start_sec !== undefined && res.shot_end_sec !== undefined && res.shot_end_sec > 0) {
+            const dur = res.shot_duration_sec !== undefined ? Number(res.shot_duration_sec).toFixed(1) : (res.shot_end_sec - res.shot_start_sec).toFixed(1);
+            const m1 = Math.floor(res.shot_start_sec / 60).toString().padStart(2, "0");
+            const s1 = Math.floor(res.shot_start_sec % 60).toString().padStart(2, "0");
+            const m2 = Math.floor(res.shot_end_sec / 60).toString().padStart(2, "0");
+            const s2 = Math.floor(res.shot_end_sec % 60).toString().padStart(2, "0");
+            timeRangeStr = `${m1}:${s1} ➔ ${m2}:${s2} (${dur}s)`;
+        } else if (res.timestamp_sec !== undefined && res.timestamp_sec !== null) {
             const totalSec = Math.floor(res.timestamp_sec);
             const m = Math.floor(totalSec / 60).toString().padStart(2, "0");
             const s = (totalSec % 60).toString().padStart(2, "0");
             timeStr = `${m}:${s}`;
         }
 
-        // Speech Box Callout
+        // Lời thoại ASR Speech Box
         let speechHtml = "";
         if (res.asr_transcript && res.asr_transcript.trim()) {
             const startStr = res.asr_start !== undefined ? Number(res.asr_start).toFixed(1) : "0.0";
@@ -2122,100 +2390,166 @@ function renderResults(results) {
         const rerankBadge = res.is_reranked ? `<span class="badge-reranked">🎯 Reranked</span>` : "";
         const sceneBadge = res.scene_name ? `<span class="scene-badge-tag">🎬 ${res.scene_name}</span>` : "";
 
-        card.innerHTML = `
-            <div class="card-thumb-wrapper" title="🔍 Bấm vào ảnh để phóng to và soi Bounding Box">
-                <img src="${res.image_url}" loading="lazy" alt="Keyframe ${res.frame_id}">
-                <span class="card-score-pill">Score: ${scoreFinal}</span>
-                ${timeStr ? `<span class="card-time-pill">⏱️ ${timeStr}</span>` : ""}
-            </div>
-            <div class="card-meta-bar">
-                <div class="card-video-row">
-                    <span class="card-vid-name">#${res.original_rank !== undefined ? res.original_rank : (idx + 1)} ${res.video_id}</span>
-                    <span class="card-frame-id">F:${res.frame_id}</span>
+        // Xác định Video URL nếu có
+        const videoUrl = res.video_url || (res.cut_file ? `http://localhost:8000/cut_videos/${res.cut_file}` : "");
+        const hasVideo = Boolean(videoUrl);
+        const imgUrl = res.image_url || res.thumbnail_url || `http://localhost:8000/images/${res.video_id}/${bestFid}.jpg`;
+
+        // Phần trình chiếu Media (Media Thumb Box)
+        let mediaHtml = "";
+        if (isShotMode) {
+            mediaHtml = `
+                <div class="card-thumb-wrapper shot-media-wrapper" style="position: relative; overflow: hidden; cursor: pointer; height: 160px; background: #000;" title="Bấm để phóng to xem Video Shot">
+                    <img src="${imgUrl}" loading="lazy" alt="Shot ${res.shot_id || bestFid}" class="shot-thumb-img" style="width: 100%; height: 100%; object-fit: cover; display: block;">
+                    ${hasVideo ? `<video src="${videoUrl}" loop muted playsinline preload="none" class="shot-video-player" style="display: none; width: 100%; height: 100%; object-fit: cover;"></video>` : ''}
+                    <span class="card-score-pill">Score: ${scoreFinal}</span>
+                    <span class="card-time-pill" style="background: rgba(14, 165, 233, 0.9); font-weight: 700;">🎬 SHOT #${res.shot_index ? res.shot_index : rankNum}</span>
+                    <div class="shot-hover-badge" style="position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,0.75); padding: 3px 8px; border-radius: 4px; font-size: 0.65rem; color: #38bdf8; pointer-events: none;">${hasVideo ? '🔍 Bấm phóng to • Hover xem trước' : '🔍 Bấm phóng to'}</div>
                 </div>
-                <div class="score-breakdown">
+            `;
+        } else {
+            mediaHtml = `
+                <div class="card-thumb-wrapper" style="position: relative; overflow: hidden; cursor: pointer; height: 160px; background: #000;" title="🔍 Bấm vào ảnh để phóng to và soi Bounding Box">
+                    <img src="${imgUrl}" loading="lazy" alt="Keyframe ${bestFid}" style="width: 100%; height: 100%; object-fit: cover; display: block;">
+                    <span class="card-score-pill">Score: ${scoreFinal}</span>
+                    ${timeStr ? `<span class="card-time-pill">⏱️ ${timeStr}</span>` : (timeRangeStr ? `<span class="card-time-pill">⏱️ ${timeRangeStr}</span>` : '')}
+                </div>
+            `;
+        }
+
+        // Minh bạch thứ hạng từng kênh thành phần (Transparency Ranks Breakdown)
+        const rankVisDisplay = res.rank_vis !== undefined && res.rank_vis !== null ? `#${res.rank_vis}` : '-';
+        const rankAsrDisplay = res.rank_asr !== undefined && res.rank_asr !== null ? `#${res.rank_asr}` : '-';
+        const rankShotDisplay = res.rank_shot !== undefined && res.rank_shot !== null ? `#${res.rank_shot}` : '-';
+
+        card.innerHTML = `
+            ${mediaHtml}
+            <div class="card-meta-bar">
+                <div class="card-video-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; cursor: pointer;" title="Bấm để xem chi tiết trong Lightbox">
+                    <span class="card-vid-name" style="color: #38bdf8; font-weight: 700;">#${rankNum} ${res.video_id}</span>
+                    <span class="card-frame-id" style="background: rgba(30, 41, 59, 0.8); color: #cbd5e1; font-size: 0.68rem; padding: 2px 6px; border-radius: 4px;">F: ${bestFid}</span>
+                </div>
+
+                <!-- Dải minh bạch thứ hạng (Transparency Ranks Strip) -->
+                <div class="transparency-ranks-strip" style="display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 5px; font-size: 0.7rem; font-family: 'JetBrains Mono', monospace;">
+                    <span class="rank-badge badge-vis" style="background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.35); border-radius: 4px; padding: 1px 5px;" title="Thứ hạng tìm kiếm Visual (Ảnh/Frame)">👁️ ${rankVisDisplay}</span>
+                    <span class="rank-badge badge-asr" style="background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 4px; padding: 1px 5px;" title="Thứ hạng tìm kiếm ASR (Giọng nói/Lời thoại)">🎙️ ${rankAsrDisplay}</span>
+                    <span class="rank-badge badge-shot" style="background: rgba(14, 165, 233, 0.2); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.35); border-radius: 4px; padding: 1px 5px;" title="Thứ hạng tìm kiếm Video Shot">🎬 ${rankShotDisplay}</span>
+                    <span class="rank-badge badge-rrf" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 4px; padding: 1px 5px; font-weight: 700;" title="Điểm RRF tổng hợp cuối cùng">⚡ ${scoreFinal}</span>
+                    ${boxBadge}
                     ${rerankBadge}
                     ${sceneBadge}
-                    <span class="badge-vis">👁️ ${scoreVis}</span>
-                    <span class="badge-asr">🎙️ ${scoreAsr}</span>
-                    ${scoreOcr > 0 ? `<span class="badge-ocr">🔤 ${scoreOcr}</span>` : ""}
-                    ${scoreObj > 0 ? `<span class="badge-obj">📦 ${scoreObj}</span>` : ""}
-                    ${boxBadge}
                 </div>
+
+                ${timeRangeStr ? `<div style="font-size: 0.72rem; color: #94a3b8; margin-bottom: 4px; font-family: 'JetBrains Mono', monospace;">⏱️ ${timeRangeStr}</div>` : ''}
                 ${speechHtml}
-                <div class="card-actions-row">
-                    <button class="btn-card-action btn-card-video" title="Xem video tại giây này">▶️ Video</button>
-                    <button class="btn-card-action btn-card-copy" title="Copy Video ID & Frame ID nộp bài">📋 Copy ID</button>
-                    <button class="btn-card-action btn-card-timeline" style="grid-column: 1 / -1;" title="Xem toàn bộ Timeline">🎞️ Timeline</button>
-                    <button class="btn-card-exclude ${isExcluded ? 'is-excluded' : ''}" title="Loại trừ / hoàn tác loại trừ video này khỏi kết quả">
+
+                <div class="card-actions-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 6px;">
+                    <button class="btn-card-action btn-card-zoom" style="background: #0ea5e9; color: white; padding: 6px 2px; font-size: 0.72rem; font-weight: 600;" title="Phóng to xem chi tiết trong Lightbox">🔍 Soi ${isShotMode ? 'Shot' : 'Chi tiết'}</button>
+                    <button class="btn-card-action btn-card-fill-sub" style="background: #0284c7; color: white; padding: 6px 2px; font-size: 0.72rem; font-weight: 600;" title="Điền Video ID và Best Keyframe vào khung Nộp bài">🎯 Nộp KIS</button>
+                    <button class="btn-card-action btn-card-timeline" style="background: #334155; color: white; padding: 6px 2px; font-size: 0.72rem; font-weight: 600;" title="Xem toàn bộ Timeline video">🎞️ Timeline</button>
+                    <button class="btn-card-action btn-card-copy" style="background: #1e293b; color: #cbd5e1; padding: 6px 2px; font-size: 0.72rem; font-weight: 600;" title="Copy Video ID & Frame ID">📋 Copy ID</button>
+                    <button class="btn-card-exclude ${isExcluded ? 'is-excluded' : ''}" style="grid-column: 1 / -1; margin-top: 2px;" title="Loại trừ / hoàn tác loại trừ video này khỏi kết quả">
                         ${isExcluded ? '🔴 Đã loại • Bỏ loại trừ' : '🚫 Loại video này'}
                     </button>
                 </div>
             </div>
         `;
 
-        // CHỈ GẮN SỰ KIỆN PHÓNG TO KHI CLICK ĐÚNG VÀO HÌNH ẢNH
-        const imgBox = card.querySelector(".card-thumb-wrapper");
-        if (imgBox) {
-            imgBox.addEventListener("click", (e) => {
+        // Gắn sự kiện phóng to Media Box
+        const mediaBox = card.querySelector(".card-thumb-wrapper");
+        const thumbImg = card.querySelector(".shot-thumb-img");
+        const videoEl = card.querySelector(".shot-video-player");
+        const hoverBadge = card.querySelector(".shot-hover-badge");
+        const vidRow = card.querySelector(".card-video-row");
+
+        if (mediaBox) {
+            if (isShotMode && videoEl) {
+                mediaBox.addEventListener("mouseenter", () => {
+                    if (thumbImg) thumbImg.style.display = "none";
+                    videoEl.style.display = "block";
+                    if (hoverBadge) hoverBadge.style.display = "none";
+                    videoEl.play().catch(e => console.warn("Hover play:", e));
+                });
+                mediaBox.addEventListener("mouseleave", () => {
+                    videoEl.pause();
+                    videoEl.currentTime = 0;
+                    videoEl.style.display = "none";
+                    if (thumbImg) thumbImg.style.display = "block";
+                    if (hoverBadge) hoverBadge.style.display = "block";
+                });
+            }
+            mediaBox.addEventListener("click", (e) => {
                 e.stopPropagation();
+                if (videoEl) videoEl.pause();
                 openLightbox(idx, results);
             });
         }
 
-        // Nút xem Video Player trực tiếp tại mốc thời gian của keyframe
-        const vidBtn = card.querySelector(".btn-card-video");
-        if (vidBtn) {
-            vidBtn.addEventListener("click", (e) => {
+        if (vidRow) {
+            vidRow.addEventListener("click", (e) => {
                 e.stopPropagation();
-                openVideoPlayer(res.video_id, res.frame_id, res.timestamp_sec);
+                if (videoEl) videoEl.pause();
+                openLightbox(idx, results);
             });
         }
 
-        // Nút Copy ID trực tiếp trên card
-        const copyBtn = card.querySelector(".btn-card-copy");
-        if (copyBtn) {
-            copyBtn.addEventListener("click", (e) => {
+        const btnZoom = card.querySelector(".btn-card-zoom");
+        if (btnZoom) {
+            btnZoom.addEventListener("click", (e) => {
                 e.stopPropagation();
-                const submissionText = `${res.video_id} ${res.frame_id}`;
+                if (videoEl) videoEl.pause();
+                openLightbox(idx, results);
+            });
+        }
+
+        const btnFillSub = card.querySelector(".btn-card-fill-sub");
+        if (btnFillSub) {
+            btnFillSub.addEventListener("click", (e) => {
+                e.stopPropagation();
+                if (subVideoIdInput) subVideoIdInput.value = res.video_id;
+                if (subFrameAInput) subFrameAInput.value = bestFid;
+                showToast(`🎯 Đã chọn: Video ${res.video_id} Frame ${bestFid}`, "success");
+            });
+        }
+
+        const btnTimeline = card.querySelector(".btn-card-timeline");
+        if (btnTimeline) {
+            btnTimeline.addEventListener("click", (e) => {
+                e.stopPropagation();
+                openTimeline(res.video_id, bestFid);
+            });
+        }
+
+        const btnCopy = card.querySelector(".btn-card-copy");
+        if (btnCopy) {
+            btnCopy.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const submissionText = `${res.video_id} ${bestFid}`;
                 navigator.clipboard.writeText(submissionText).then(() => {
-                    copyBtn.innerText = "✅ ĐÃ COPY!";
+                    btnCopy.innerText = "✅ ĐÃ COPY!";
                     showToast(`📋 Đã sao chép: ${submissionText}`, "success", 1800);
                     setTimeout(() => {
-                        copyBtn.innerText = "📋 Copy ID";
+                        btnCopy.innerText = "📋 Copy ID";
                     }, 1500);
                 });
             });
         }
 
-        // Nút xem Timeline với tính năng Auto-scroll đến đúng frame hiện tại
-        const tlBtn = card.querySelector(".btn-card-timeline");
-        if (tlBtn) {
-            tlBtn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                openTimeline(res.video_id, res.frame_id);
-            });
-        }
-
-        // Nút Quick-Exclude: Toggle loại trừ Video này khỏi currentExcludeTags
         const excludeBtn = card.querySelector(".btn-card-exclude");
         if (excludeBtn) {
             excludeBtn.addEventListener("click", (e) => {
                 e.stopPropagation();
                 const vidUpper = (res.video_id || "").toUpperCase();
-                const idx = currentExcludeTags.indexOf(vidUpper);
-                if (idx === -1) {
-                    // Chưa có → Thêm vào Exclude
+                const eIdx = currentExcludeTags.indexOf(vidUpper);
+                if (eIdx === -1) {
                     currentExcludeTags.push(vidUpper);
                     showToast(`🚫 Đã loại trừ video ${res.video_id} khỏi danh sách`, "warning", 2000);
                 } else {
-                    // Đã có → Xóa khỏi Exclude (Toggle bỏ loại trừ)
-                    currentExcludeTags.splice(idx, 1);
+                    currentExcludeTags.splice(eIdx, 1);
                     showToast(`✅ Đã bỏ loại trừ video ${res.video_id}`, "success", 2000);
                 }
-                // Cập nhật dashboard Exclude Tags
                 renderExcludeTags();
-                // Cập nhật trạng thái mờ/sáng của TẤT CẢ card cùng video_id trong lưới
                 applyExcludeStateToGrid();
             });
         }
@@ -2224,11 +2558,18 @@ function renderResults(results) {
     });
 }
 
+// Giữ hàm renderShotResults để tương thích ngược, gọi renderResults ở chế độ "shot"
+function renderShotResults(shots) {
+    renderResults(shots, "shot");
+}
+
 // ==========================================================================
 // APPLY EXCLUDE STATE TO GRID (không re-render, chỉ cập nhật CSS trực tiếp)
 // ==========================================================================
 function applyExcludeStateToGrid() {
     if (!resultsGrid) return;
+
+    // 1. Cập nhật các thẻ kết quả chế độ KIS / QA
     const cards = resultsGrid.querySelectorAll(".result-card");
     cards.forEach(card => {
         const videoId = (card.dataset.videoId || "").toUpperCase();
@@ -2238,7 +2579,6 @@ function applyExcludeStateToGrid() {
         } else {
             card.classList.remove("card-excluded");
         }
-        // Cập nhật nút exclude trên card
         const excludeBtn = card.querySelector(".btn-card-exclude");
         if (excludeBtn) {
             if (isExcluded) {
@@ -2250,10 +2590,94 @@ function applyExcludeStateToGrid() {
             }
         }
     });
+
+    // 2. Cập nhật các thẻ chuỗi phân cảnh chế độ TRAKE Storyboard
+    const trakeCards = resultsGrid.querySelectorAll(".trake-group-card");
+    trakeCards.forEach(card => {
+        const videoId = (card.dataset.videoId || "").toUpperCase();
+        const isExcluded = currentExcludeTags.includes(videoId);
+        if (isExcluded) {
+            card.classList.add("card-excluded");
+        } else {
+            card.classList.remove("card-excluded");
+        }
+        const excludeBtn = card.querySelector(".btn-sb-exclude");
+        if (excludeBtn) {
+            if (isExcluded) {
+                excludeBtn.classList.add("is-excluded");
+                excludeBtn.textContent = "🔴 Đã loại • Bỏ loại";
+            } else {
+                excludeBtn.classList.remove("is-excluded");
+                excludeBtn.textContent = "🚫 Loại video";
+            }
+        }
+    });
 }
 window.applyExcludeStateToGrid = applyExcludeStateToGrid;
 
+function setLightboxMediaMode(mode, item = null, bestFid = null) {
+    if (!item && activeResultsSource && activeResultsSource[currentLightboxIndex]) {
+        item = activeResultsSource[currentLightboxIndex];
+    }
+    if (!item) return;
 
+    if (!bestFid) {
+        bestFid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id || "";
+        if (typeof bestFid === "number") bestFid = String(bestFid).padStart(6, "0");
+    }
+
+    currentLightboxMediaMode = mode;
+
+    if (mode === "shot" && (item.video_url || item.cut_file)) {
+        if (btnLightboxModeShot) {
+            btnLightboxModeShot.style.background = "#0284c7";
+            btnLightboxModeShot.style.color = "white";
+        }
+        if (btnLightboxModeKf) {
+            btnLightboxModeKf.style.background = "rgba(30, 41, 59, 0.8)";
+            btnLightboxModeKf.style.color = "#94a3b8";
+        }
+        if (lightboxShotBox) lightboxShotBox.style.display = "flex";
+        if (lightboxZoomBox) lightboxZoomBox.style.display = "none";
+        if (lightboxCanvasControls) lightboxCanvasControls.style.display = "none";
+        if (lightboxShotControls) lightboxShotControls.style.display = "flex";
+
+        if (lightboxShotVideo) {
+            const vUrl = item.video_url || `http://localhost:8000/cut_videos/${item.cut_file}`;
+            if (lightboxShotVideo.src !== vUrl) {
+                lightboxShotVideo.src = vUrl;
+            }
+            lightboxShotVideo.currentTime = 0;
+            lightboxShotVideo.play().catch(e => console.warn("Shot autoplay blocked:", e));
+        }
+    } else {
+        if (btnLightboxModeKf) {
+            btnLightboxModeKf.style.background = "#3b82f6";
+            btnLightboxModeKf.style.color = "white";
+        }
+        if (btnLightboxModeShot) {
+            btnLightboxModeShot.style.background = "rgba(30, 41, 59, 0.8)";
+            btnLightboxModeShot.style.color = "#94a3b8";
+        }
+        if (lightboxShotVideo) {
+            lightboxShotVideo.pause();
+        }
+        if (lightboxShotBox) lightboxShotBox.style.display = "none";
+        if (lightboxZoomBox) lightboxZoomBox.style.display = "block";
+        if (lightboxCanvasControls) lightboxCanvasControls.style.display = "flex";
+        if (lightboxShotControls) lightboxShotControls.style.display = "none";
+
+        const imgUrl = item.thumbnail_url || item.image_url || `http://localhost:8000/images/${item.video_id}/${bestFid}.jpg`;
+        if (lightboxImg) {
+            lightboxImg.src = imgUrl;
+            if (lightboxImg.complete) {
+                setTimeout(drawLightboxCanvas, 50);
+            } else {
+                lightboxImg.onload = () => setTimeout(drawLightboxCanvas, 50);
+            }
+        }
+    }
+}
 
 async function openLightbox(index, sourceList = currentResults) {
     activeResultsSource = sourceList;
@@ -2263,15 +2687,48 @@ async function openLightbox(index, sourceList = currentResults) {
 
     currentLightboxIndex = index;
     const item = activeResultsSource[currentLightboxIndex];
+    const isShotItem = Boolean(item.shot_id || item.video_url || item.cut_file);
 
-    lightboxTitle.innerText = `${item.video_id} / ${item.frame_id}.jpg`;
+    let bestFid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id || "";
+    if (typeof bestFid === "number") {
+        bestFid = String(bestFid).padStart(6, "0");
+    }
+
+    const rankNum = item.original_rank !== undefined ? item.original_rank : (index + 1);
+    const shotIdxStr = item.shot_index ? `#${item.shot_index}` : (item.shot_id ? item.shot_id : "");
+    lightboxTitle.innerText = `${item.video_id} / F: ${bestFid} ${shotIdxStr ? '(' + shotIdxStr + ')' : ''}`;
+
     const scoreVal = item.score !== undefined ? Number(item.score).toFixed(4) : "1.0000";
-    lightboxScoreBadge.innerText = `Score: ${scoreVal}`;
+    lightboxScoreBadge.innerText = `Rank #${rankNum} • RRF: ${scoreVal}`;
 
-    const sec = item.timestamp_sec || 0;
-    const mins = Math.floor(sec / 60);
-    const secs = Math.floor(sec % 60);
-    lightboxTimeBadge.innerText = `⏱️ ${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')} (${sec}s)`;
+    const sSec = item.shot_start_sec !== undefined ? item.shot_start_sec : (item.start_sec !== undefined ? item.start_sec : null);
+    const eSec = item.shot_end_sec !== undefined ? item.shot_end_sec : (item.end_sec !== undefined ? item.end_sec : null);
+    if (sSec !== null && eSec !== null && eSec > 0) {
+        const dur = (item.shot_duration_sec || item.duration_sec || (eSec - sSec)).toFixed(1);
+        const m1 = Math.floor(sSec / 60).toString().padStart(2, "0");
+        const s1 = Math.floor(sSec % 60).toString().padStart(2, "0");
+        const m2 = Math.floor(eSec / 60).toString().padStart(2, "0");
+        const s2 = Math.floor(eSec % 60).toString().padStart(2, "0");
+        lightboxTimeBadge.innerText = `⏱️ ${m1}:${s1} ➔ ${m2}:${s2} (${dur}s)`;
+    } else {
+        const sec = item.timestamp_sec || 0;
+        const mins = Math.floor(sec / 60);
+        const secs = Math.floor(sec % 60);
+        lightboxTimeBadge.innerText = `⏱️ ${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')} (${sec}s)`;
+    }
+
+    // Hiển thị dải huy hiệu minh bạch thứ hạng thành phần trong Lightbox Sidebar
+    const ranksStrip = document.getElementById("lightbox-ranks-strip");
+    if (ranksStrip) {
+        const rVis = item.rank_vis !== undefined && item.rank_vis !== null ? `#${item.rank_vis}` : '-';
+        const rAsr = item.rank_asr !== undefined && item.rank_asr !== null ? `#${item.rank_asr}` : '-';
+        const rShot = item.rank_shot !== undefined && item.rank_shot !== null ? `#${item.rank_shot}` : '-';
+        ranksStrip.innerHTML = `
+            <span style="background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); border-radius: 4px; padding: 2px 7px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace;" title="Thứ hạng Visual Search">👁️ Visual: ${rVis}</span>
+            <span style="background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); border-radius: 4px; padding: 2px 7px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace;" title="Thứ hạng ASR Search">🎙️ ASR: ${rAsr}</span>
+            <span style="background: rgba(14, 165, 233, 0.2); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.4); border-radius: 4px; padding: 2px 7px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace;" title="Thứ hạng Video Shot Search">🎬 Shot: ${rShot}</span>
+        `;
+    }
 
     if (copyStatus) copyStatus.innerText = "";
     
@@ -2307,26 +2764,27 @@ async function openLightbox(index, sourceList = currentResults) {
     // Mở modal trước để layout tính đúng clientWidth / clientHeight
     lightboxModal.style.display = "flex";
 
-    // Set image source và kích hoạt vẽ canvas sau khi layout sẵn sàng
-    lightboxImg.src = item.image_url;
-    if (lightboxImg.complete) {
-        setTimeout(drawLightboxCanvas, 50);
+    // Xử lý hiển thị Video Shot vs Keyframe (mặc định mở theo chế độ currentViewMode)
+    if (isShotItem) {
+        if (lightboxMediaSwitcher) lightboxMediaSwitcher.style.display = "flex";
+        setLightboxMediaMode(currentViewMode === "shot" ? "shot" : "kf", item, bestFid);
     } else {
-        lightboxImg.onload = () => {
-            setTimeout(drawLightboxCanvas, 50);
-        };
+        if (lightboxMediaSwitcher) lightboxMediaSwitcher.style.display = "none";
+        setLightboxMediaMode("kf", item, bestFid);
     }
 
     // Nếu item.boxes chưa có, gọi API lấy on-demand
-    if (!item.boxes || item.boxes.length === 0) {
+    if ((!item.boxes || item.boxes.length === 0) && bestFid) {
         try {
-            const bRes = await fetch(`http://localhost:8000/api/keyframe-boxes/${item.video_id}/${item.frame_id}`);
+            const bRes = await fetch(`http://localhost:8000/api/keyframe-boxes/${item.video_id}/${bestFid}`);
             if (bRes.ok) {
                 const bData = await bRes.json();
                 if (bData.status === "success" && bData.boxes && bData.boxes.length > 0) {
                     item.boxes = bData.boxes;
                     renderBoxPills(item.boxes);
-                    setTimeout(drawLightboxCanvas, 30);
+                    if (currentLightboxMediaMode === "kf") {
+                        setTimeout(drawLightboxCanvas, 30);
+                    }
                 }
             }
         } catch (e) {
@@ -2337,6 +2795,10 @@ async function openLightbox(index, sourceList = currentResults) {
 
 function closeLightbox() {
     resetZoom();
+    if (lightboxShotVideo) {
+        lightboxShotVideo.pause();
+        lightboxShotVideo.src = "";
+    }
     if (lightboxModal) lightboxModal.style.display = "none";
 }
 
@@ -2489,7 +2951,9 @@ if (lightboxVideoBtn) {
     lightboxVideoBtn.addEventListener("click", () => {
         const item = activeResultsSource[currentLightboxIndex];
         if (item && item.video_id) {
-            openVideoPlayer(item.video_id, item.frame_id, item.timestamp_sec);
+            const fid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id;
+            const tSec = (item.start_sec !== undefined) ? item.start_sec : (item.timestamp_sec || 0);
+            openVideoPlayer(item.video_id, fid, tSec);
         }
     });
 }
@@ -2499,7 +2963,8 @@ if (lightboxCopyBtn) {
     lightboxCopyBtn.addEventListener("click", () => {
         const item = activeResultsSource[currentLightboxIndex];
         if (item) {
-            const textToCopy = `${item.video_id} ${item.frame_id}`;
+            const fid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id;
+            const textToCopy = `${item.video_id} ${fid}`;
             navigator.clipboard.writeText(textToCopy).then(() => {
                 if (copyStatus) {
                     copyStatus.innerText = `✅ Đã chép: ${textToCopy}`;
@@ -2517,8 +2982,9 @@ if (lightboxTimelineBtn) {
     lightboxTimelineBtn.addEventListener("click", () => {
         const item = activeResultsSource[currentLightboxIndex];
         if (item && item.video_id) {
+            const fid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id;
             closeLightbox(); // Tự động đóng/ẩn Lightbox để Timeline hiển thị ngay lập tức lên phía trước!
-            openTimeline(item.video_id, item.frame_id);
+            openTimeline(item.video_id, fid);
         }
     });
 }
@@ -2724,6 +3190,9 @@ if (lightboxModal) {
 
 // Phím tắt bàn phím
 window.addEventListener("keydown", (e) => {
+    const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : "";
+    if (activeTag === "input" || activeTag === "textarea") return;
+
     if (videoModal && videoModal.style.display !== "none") {
         if (e.key === "Escape") {
             closeVideoPlayer();
@@ -2731,6 +3200,25 @@ window.addEventListener("keydown", (e) => {
     } else if (lightboxModal && lightboxModal.style.display !== "none") {
         if (e.key === "Escape") {
             closeLightbox();
+        } else if (e.key === "ArrowLeft") {
+            e.preventDefault();
+            if (currentLightboxIndex > 0) {
+                openLightbox(currentLightboxIndex - 1, activeResultsSource);
+            }
+        } else if (e.key === "ArrowRight") {
+            e.preventDefault();
+            if (activeResultsSource && currentLightboxIndex < activeResultsSource.length - 1) {
+                openLightbox(currentLightboxIndex + 1, activeResultsSource);
+            }
+        } else if (e.key === " " || e.code === "Space") {
+            if (currentLightboxMediaMode === "shot" && lightboxShotVideo) {
+                e.preventDefault();
+                if (lightboxShotVideo.paused) {
+                    lightboxShotVideo.play();
+                } else {
+                    lightboxShotVideo.pause();
+                }
+            }
         }
     } else if (timelineModal && timelineModal.style.display !== "none") {
         if (e.key === "Escape") {
@@ -3084,10 +3572,16 @@ if (lightboxSubBtn) {
         const item = activeResultsSource[currentLightboxIndex];
         if (!item) return;
 
+        let fid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id || "";
+        if (typeof fid === "number") fid = String(fid).padStart(6, "0");
+
         if (subVideoIdInput) subVideoIdInput.value = item.video_id;
-        if (subFrameAInput) subFrameAInput.value = item.frame_id;
-        if (subFrameBInput && !subFrameBInput.value) {
-            subFrameBInput.value = item.frame_id + 300;
+        if (subFrameAInput) subFrameAInput.value = fid;
+        if (subFrameBInput && !subFrameBInput.value && fid) {
+            const numFid = parseInt(fid);
+            if (!isNaN(numFid)) {
+                subFrameBInput.value = String(numFid + 300).padStart(6, "0");
+            }
         }
 
         // Mở card Submission nếu đang bị thu gọn
@@ -3100,7 +3594,7 @@ if (lightboxSubBtn) {
             cardSubmission.scrollIntoView({ behavior: "smooth", block: "center" });
         }
 
-        showToast(`📥 Đã nạp ${item.video_id} frame ${item.frame_id} vào Submission Manager!`, "success", 2000);
+        showToast(`📥 Đã nạp ${item.video_id} frame ${fid} vào Submission Manager!`, "success", 2000);
     });
 }
 

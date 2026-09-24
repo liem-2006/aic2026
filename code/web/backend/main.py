@@ -31,14 +31,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Route tính năng tĩnh (Static file server để phục vụ hình ảnh keyframe & video gốc .mp4)
-from fastapi.responses import Response
+# Route phục vụ hình ảnh keyframe kèm Smart Fallback (tránh triệt để lỗi 404 do lệch bước nhảy frame)
+import bisect
+from fastapi.responses import Response, FileResponse
 
-if os.path.exists(config.KF_DIR):
-    app.mount("/images", StaticFiles(directory=config.KF_DIR), name="images")
+_video_frames_cache: Dict[str, List[int]] = {}
+
+@app.get("/images/{video_id}/{frame_file}")
+async def serve_keyframe_image(video_id: str, frame_file: str):
+    """
+    Phục vụ ảnh Keyframe với cơ chế Smart Fallback.
+    Nếu frame ID yêu cầu (do tính toán timestamp lệch 25fps) không tồn tại,
+    tự động tìm và phục vụ keyframe thực tế gần nhất trong video đó bằng binary search O(log N).
+    """
+    target_path = os.path.join(config.KF_DIR, video_id, frame_file)
+    if os.path.exists(target_path):
+        return FileResponse(target_path)
+    
+    video_dir = os.path.join(config.KF_DIR, video_id)
+    if not os.path.exists(video_dir):
+        return Response(status_code=404)
+        
+    try:
+        frame_stem = os.path.splitext(frame_file)[0]
+        target_frame_num = int(frame_stem)
+    except ValueError:
+        return Response(status_code=404)
+
+    if video_id not in _video_frames_cache:
+        try:
+            frames = []
+            for f in os.listdir(video_dir):
+                if f.lower().endswith(".jpg"):
+                    try:
+                        frames.append(int(os.path.splitext(f)[0]))
+                    except ValueError:
+                        pass
+            frames.sort()
+            _video_frames_cache[video_id] = frames
+        except Exception:
+            _video_frames_cache[video_id] = []
+            
+    frames = _video_frames_cache[video_id]
+    if not frames:
+        return Response(status_code=404)
+        
+    idx = bisect.bisect_left(frames, target_frame_num)
+    if idx == 0:
+        best_num = frames[0]
+    elif idx >= len(frames):
+        best_num = frames[-1]
+    else:
+        before = frames[idx - 1]
+        after = frames[idx]
+        best_num = before if (target_frame_num - before) <= (after - target_frame_num) else after
+        
+    fallback_path = os.path.join(video_dir, f"{best_num:06d}.jpg")
+    if os.path.exists(fallback_path):
+        return FileResponse(fallback_path)
+    return Response(status_code=404)
 
 if os.path.exists(config.VIDEO_DIR):
     app.mount("/videos", StaticFiles(directory=config.VIDEO_DIR), name="videos")
+
+cut_videos_dir = getattr(config, "CUT_VIDEOS_BASE", "")
+if os.path.exists(cut_videos_dir):
+    app.mount("/cut_videos", StaticFiles(directory=cut_videos_dir), name="cut_videos")
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
@@ -72,6 +130,10 @@ class SearchRequest(BaseModel):
     use_rrf: bool = True              # Bật / tắt chế độ RRF
     rrf_k: int = 60                   # Tham số k của RRF
     asr_window_n: int = 1             # Số segment liền kề mở rộng ASR (±N)
+    rrf_use_visual: bool = True       # Tín hiệu KF Visual tham gia RRF
+    rrf_use_asr: bool = True          # Tín hiệu ASR tham gia RRF
+    rrf_use_shot: bool = True         # Tín hiệu Video Shot tham gia RRF
+    return_shots: bool = True         # Trả về cả danh sách Shot song song
 
 class ImageSearchRequest(BaseModel):
     image_base64: Optional[Union[str, List[str]]] = None # Ảnh base64 hoặc danh sách ảnh multi-view
@@ -101,6 +163,10 @@ class ImageSearchRequest(BaseModel):
     use_rrf: bool = True              # Bật / tắt chế độ RRF
     rrf_k: int = 60                   # Tham số k của RRF
     asr_window_n: int = 1             # Số segment liền kề mở rộng ASR (±N)
+    rrf_use_visual: bool = True       # Tín hiệu KF Visual tham gia RRF
+    rrf_use_asr: bool = True          # Tín hiệu ASR tham gia RRF
+    rrf_use_shot: bool = True         # Tín hiệu Video Shot tham gia RRF
+    return_shots: bool = True         # Trả về cả danh sách Shot song song
 
 class RerankRequest(BaseModel):
     candidate_video_ids: List[str]
@@ -179,6 +245,10 @@ class MultiSceneSearchRequest(BaseModel):
     k_paths: int = 3
     trake_top_k: int = 10
     asr_window_n: int = 1
+    rrf_use_visual: bool = True
+    rrf_use_asr: bool = True
+    rrf_use_shot: bool = True
+    return_shots: bool = True
 
 class QwenRerankFrameRequest(BaseModel):
     query: str
@@ -401,6 +471,10 @@ async def rerank_top_videos_endpoint(request: RerankTopVideosRequest):
     results = result_data["results"]
     for r in results:
         r["image_url"] = f"http://localhost:8000/images/{r['video_id']}/{r['frame_id']}.jpg"
+        if r.get("cut_file"):
+            r["video_url"] = f"http://localhost:8000/cut_videos/{r['cut_file']}"
+        else:
+            r["video_url"] = ""
 
     return {
         "status": "success",
@@ -425,7 +499,7 @@ async def search_image_endpoint(request: ImageSearchRequest):
         obj_class = request.object_class_id if request.enable_object else None
         obj_weight = request.weight_object if request.enable_object else 0.0
 
-        results = engine.search_by_image(
+        res_data = engine.search_by_image(
             query_image=img,
             query_text=request.query,
             image_weight=request.image_weight,
@@ -450,11 +524,30 @@ async def search_image_endpoint(request: ImageSearchRequest):
             top_k=request.top_k,
             use_rrf=request.use_rrf,
             rrf_k=request.rrf_k,
-            asr_window_n=request.asr_window_n
+            asr_window_n=request.asr_window_n,
+            rrf_use_visual=request.rrf_use_visual,
+            rrf_use_asr=request.rrf_use_asr,
+            rrf_use_shot=request.rrf_use_shot,
+            return_shots=request.return_shots
         )
+
+        if isinstance(res_data, dict):
+            results = res_data.get("results", [])
+            shot_results = res_data.get("shot_results", [])
+        else:
+            results = res_data
+            shot_results = []
 
         for r in results:
             r["image_url"] = f"http://localhost:8000/images/{r['video_id']}/{r['frame_id']}.jpg"
+            if r.get("cut_file"):
+                r["video_url"] = f"http://localhost:8000/cut_videos/{r['cut_file']}"
+            else:
+                r["video_url"] = ""
+
+        for s in shot_results:
+            s["video_url"] = f"http://localhost:8000/cut_videos/{s['cut_file']}"
+            s["thumbnail_url"] = f"http://localhost:8000/images/{s['video_id']}/{s['best_kf_frame_id']}.jpg"
 
         top_videos = []
         for r in results:
@@ -465,6 +558,7 @@ async def search_image_endpoint(request: ImageSearchRequest):
         return {
             "status": "success",
             "results": results,
+            "shot_results": shot_results,
             "top_videos": top_videos,
             "total_candidates": len(results),
             "elapsed_sec": elapsed
@@ -485,7 +579,7 @@ async def search_image_endpoint(request: ImageSearchRequest):
 async def search_multi_scene_endpoint(request: MultiSceneSearchRequest):
     """Truy vấn Đa Phân Cảnh (Multi-Scene / TRAKE Temporal Query Decomposition & Video Voting)."""
     engine = get_search_engine()
-    scenes_data = [s.dict() for s in request.scenes]
+    scenes_data = [s.model_dump() if hasattr(s, "model_dump") else s.dict() for s in request.scenes]
     
     result_data = engine.search_multi_scene(
         scenes=scenes_data,
@@ -518,20 +612,36 @@ async def search_multi_scene_endpoint(request: MultiSceneSearchRequest):
         include_videos=request.include_videos,
         exclude_videos=request.exclude_videos,
         category=request.category,
-        sub_category=request.sub_category
+        sub_category=request.sub_category,
+        rrf_use_visual=request.rrf_use_visual,
+        rrf_use_asr=request.rrf_use_asr,
+        rrf_use_shot=request.rrf_use_shot,
+        return_shots=request.return_shots
     )
 
-    # Đính kèm image_url cho toàn bộ frames
     for sc in result_data.get("scenes_results", []):
         for r in sc.get("results", []):
             r["image_url"] = f"http://localhost:8000/images/{r['video_id']}/{r['frame_id']}.jpg"
+            if r.get("cut_file"):
+                r["video_url"] = f"http://localhost:8000/cut_videos/{r['cut_file']}"
+            else:
+                r["video_url"] = ""
+        for s in sc.get("shot_results", []):
+            s["video_url"] = f"http://localhost:8000/cut_videos/{s['cut_file']}"
+            s["thumbnail_url"] = f"http://localhost:8000/images/{s['video_id']}/{s['best_kf_frame_id']}.jpg"
 
     for r in result_data.get("combined_results", []):
         r["image_url"] = f"http://localhost:8000/images/{r['video_id']}/{r['frame_id']}.jpg"
+        if r.get("cut_file"):
+            r["video_url"] = f"http://localhost:8000/cut_videos/{r['cut_file']}"
+        else:
+            r["video_url"] = ""
 
     for seq in result_data.get("storyboard_sequences", []):
         for sc_item in seq.get("scenes", []):
             sc_item["image_url"] = f"http://localhost:8000/images/{sc_item['video_id']}/{sc_item['frame_id']}.jpg"
+            if sc_item.get("cut_file"):
+                sc_item["video_url"] = f"http://localhost:8000/cut_videos/{sc_item['cut_file']}"
 
     return {
         "status": "success",
@@ -618,7 +728,7 @@ async def search_endpoint(request: SearchRequest):
 
     query_img = decode_images_from_request(request)
 
-    results = engine.search(
+    res_data = engine.search(
         query_text=request.query,
         ocr_query=request.ocr_query,
         speech_query=request.speech_query,
@@ -643,14 +753,38 @@ async def search_endpoint(request: SearchRequest):
         rrf_k=request.rrf_k,
         asr_window_n=request.asr_window_n,
         query_image=query_img,
-        image_weight=request.image_weight
+        image_weight=request.image_weight,
+        rrf_use_visual=request.rrf_use_visual,
+        rrf_use_asr=request.rrf_use_asr,
+        rrf_use_shot=request.rrf_use_shot,
+        return_shots=request.return_shots
     )
 
-    # Gắn thêm URL hình ảnh cho Web hiển thị
+    if isinstance(res_data, dict):
+        results = res_data.get("results", [])
+        shot_results = res_data.get("shot_results", [])
+    else:
+        results = res_data
+        shot_results = []
+
+    # Gắn thêm URL hình ảnh và Video URL cho Web hiển thị
     for r in results:
         r["image_url"] = f"http://localhost:8000/images/{r['video_id']}/{r['frame_id']}.jpg"
+        if r.get("cut_file"):
+            r["video_url"] = f"http://localhost:8000/cut_videos/{r['cut_file']}"
+        else:
+            r["video_url"] = ""
 
-    return {"status": "success", "results": results}
+    # Gắn thêm video URL và thumbnail URL cho Video Shots
+    for s in shot_results:
+        s["video_url"] = f"http://localhost:8000/cut_videos/{s['cut_file']}"
+        s["thumbnail_url"] = f"http://localhost:8000/images/{s['video_id']}/{s['best_kf_frame_id']}.jpg"
+
+    return {
+        "status": "success",
+        "results": results,
+        "shot_results": shot_results
+    }
 
 # ==============================================================================
 # SUBMISSION GENERATOR & ZIP EXPORTER ENDPOINTS (AIC 2026 CONTEST SUITE)
@@ -843,4 +977,10 @@ if __name__ == "__main__":
     get_search_engine()
     print("🚀 [AIC 2026] Server đã sẵn sàng phục vụ tại http://localhost:8000")
     print("=====================================================================")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        timeout_graceful_shutdown=2,
+        timeout_keep_alive=3
+    )

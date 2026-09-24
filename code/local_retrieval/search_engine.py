@@ -13,7 +13,7 @@ import re
 import json
 import time
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 
 from usearch.index import Index
 
@@ -72,16 +72,35 @@ class VideoSearchEngine:
             print(f"[SearchEngine] Đang nạp LanceDB Vector Database từ: {config.LANCEDB_PATH}...")
             self.lancedb_client = lancedb.connect(config.LANCEDB_PATH)
             self.lancedb_table = self.lancedb_client.open_table("keyframes")
-            if "keyframes_beit3" in self.lancedb_client.table_names():
+            
+            existing_tables = []
+            try:
+                existing_tables = self.lancedb_client.table_names()
+            except Exception:
+                try:
+                    existing_tables = self.lancedb_client.list_tables().tables
+                except Exception:
+                    existing_tables = []
+
+            if "keyframes_beit3" in existing_tables:
                 self.beit3_table = self.lancedb_client.open_table("keyframes_beit3")
+            
+            # 2.1 Bảng video_shots (Qwen3-VL Video 2048D)
+            self.shot_table = None
+            shot_tbl_name = getattr(config, "VIDEO_SHOT_TABLE", "video_shots")
+            if shot_tbl_name in existing_tables:
+                self.shot_table = self.lancedb_client.open_table(shot_tbl_name)
+                print(f"[SearchEngine] ✅ Nạp bảng '{shot_tbl_name}': {len(self.shot_table):,} items.")
+
             self.d = config.EMBEDDING_DIM
-            print(f"[SearchEngine] ✅ LanceDB Engine (0 MB baseline RAM) nạp xong | Bảng 'keyframes': {len(self.lancedb_table):,} items.")
+            print(f"[SearchEngine] ✅ LanceDB Engine nạp xong | Bảng 'keyframes': {len(self.lancedb_table):,} items.")
 
             # Nạp mmap ma trận embedding Qwen (0 MB RAM) để Cross-Scoring siêu tốc
             self.qwen_mmap = None
             if os.path.exists(config.QWEN_INDEX_PATH):
                 self.qwen_mmap = np.load(config.QWEN_INDEX_PATH, mmap_mode="r")
         else:
+            self.shot_table = None
             if not os.path.exists(config.QWEN_INDEX_PATH):
                 raise FileNotFoundError(f"Không tìm thấy index: {config.QWEN_INDEX_PATH}")
 
@@ -120,6 +139,27 @@ class VideoSearchEngine:
             with open(config.FPS_MAPPING_PATH, "r", encoding="utf-8") as f:
                 self.fps_mapping = json.load(f)
             print(f"[SearchEngine] ✅ Đã nạp FPS Mapping cho {len(self.fps_mapping):,} videos.")
+
+        # 7. Video Shot Mappings (Tra cứu O(1) KF <-> Shot)
+        self.kf_shot_map: Dict[str, str] = {}
+        kf_map_path = getattr(config, "KF_SHOT_MAP_PATH", "")
+        if os.path.exists(kf_map_path):
+            try:
+                with open(kf_map_path, "r", encoding="utf-8") as f:
+                    self.kf_shot_map = json.load(f)
+                print(f"[SearchEngine] ✅ Đã nạp KF->Shot Mapping: {len(self.kf_shot_map):,} keys.")
+            except Exception as e:
+                print(f"[SearchEngine] ⚠️ Lỗi đọc kf_shot_map: {e}")
+
+        self.shot_meta_map: Dict[str, Dict[str, Any]] = {}
+        shot_meta_path = getattr(config, "SHOT_METADATA_MAP_PATH", "")
+        if os.path.exists(shot_meta_path):
+            try:
+                with open(shot_meta_path, "r", encoding="utf-8") as f:
+                    self.shot_meta_map = json.load(f)
+                print(f"[SearchEngine] ✅ Đã nạp Shot Metadata: {len(self.shot_meta_map):,} shots.")
+            except Exception as e:
+                print(f"[SearchEngine] ⚠️ Lỗi đọc shot_meta_map: {e}")
 
         print(f"[SearchEngine] ✅ Khởi tạo xong trong {time.time() - t0:.2f}s | {len(self.mapping):,} frames sẵn sàng")
 
@@ -230,6 +270,59 @@ class VideoSearchEngine:
 
         return timeline_frames
 
+    def _search_shots(
+        self,
+        query_vec: np.ndarray,
+        top_k: int = 200,
+        effective_include: Optional[List[str]] = None,
+        effective_exclude: Optional[List[str]] = None,
+        category: str = "",
+        sub_category: str = ""
+    ) -> List[Dict[str, Any]]:
+        """Truy vấn trực tiếp trên bảng video_shots (LanceDB) với bộ lọc pushdown."""
+        if self.shot_table is None or query_vec is None:
+            return []
+
+        try:
+            vec_list = query_vec.tolist() if isinstance(query_vec, np.ndarray) else query_vec
+            q_builder = self.shot_table.search(vec_list)
+            where_clauses = []
+
+            if effective_include:
+                exact_inc = [v for v in effective_include if "_" in v]
+                prefix_inc = [v for v in effective_include if "_" not in v]
+                inc_parts = []
+                if exact_inc:
+                    v_str = ", ".join([f"'{v}'" for v in exact_inc])
+                    inc_parts.append(f"video_id IN ({v_str})")
+                for pfx in prefix_inc:
+                    inc_parts.append(f"video_id LIKE '{pfx}%'")
+                if inc_parts:
+                    where_clauses.append(" OR ".join(inc_parts))
+
+            if effective_exclude:
+                exact_exc = [v for v in effective_exclude if "_" in v]
+                prefix_exc = [v for v in effective_exclude if "_" not in v]
+                for v in exact_exc:
+                    where_clauses.append(f"video_id != '{v}'")
+                for pfx in prefix_exc:
+                    where_clauses.append(f"NOT (video_id LIKE '{pfx}%')")
+
+            if category and category.strip() and category != "all":
+                where_clauses.append(f"category = '{category.strip()}'")
+            if sub_category and sub_category.strip() and sub_category != "all":
+                where_clauses.append(f"sub_category = '{sub_category.strip()}'")
+
+            if where_clauses:
+                full_where = " AND ".join([f"({c})" for c in where_clauses])
+                q_builder = q_builder.where(full_where)
+
+            df = q_builder.metric("cosine").limit(top_k).to_pandas()
+            return df.to_dict("records")
+        except Exception as e:
+            print(f"[SearchEngine] ⚠️ Lỗi tìm kiếm video_shots: {e}")
+            return []
+
     def search(
         self,
         query_text: str = "",
@@ -258,8 +351,12 @@ class VideoSearchEngine:
         query_vec: Optional[np.ndarray] = None,
         query_image: Optional[Any] = None,
         image_weight: float = 0.5,
+        rrf_use_visual: bool = True,       # Tín hiệu KF Visual tham gia RRF
+        rrf_use_asr: bool = True,          # Tín hiệu ASR tham gia RRF
+        rrf_use_shot: bool = True,         # Tín hiệu Video Shot tham gia RRF
+        return_shots: bool = False,        # Trả về cả {results, shot_results}
         **kwargs
-    ) -> List[Dict[str, Any]]:
+    ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Truy vấn đa phương thức kết hợp:
         Qwen3-VL (Visual + OCR + Image + Composed Image/Text) + Whisper (ASR) + RT-DETR (Object Detection).
@@ -336,6 +433,7 @@ class VideoSearchEngine:
 
         # Bảng gom điểm theo keyframe path: path -> dict thông tin
         frame_candidates: Dict[str, Dict[str, Any]] = {}
+        shot_cands: List[Dict[str, Any]] = []
         encoder = get_text_encoder()
 
         # --- BƯỚC 2A: KÊNH VISUAL SEARCH (QWEN3-VL 2048D ĐA HÌNH: CHỮ / ẢNH / KẾT HỢP) ---
@@ -355,6 +453,17 @@ class VideoSearchEngine:
                 )
 
             if query_vec is not None and query_vec.shape[0] == self.d:
+                # Tìm kiếm Video Shots song song
+                if (rrf_use_shot or return_shots) and self.shot_table is not None:
+                    shot_cands = self._search_shots(
+                        query_vec=query_vec,
+                        top_k=max(top_k * 5, 200),
+                        effective_include=effective_include,
+                        effective_exclude=effective_exclude,
+                        category=category,
+                        sub_category=sub_category
+                    )
+
                 search_k = min(len(self.mapping), max(top_k * 30, 2000))
 
                 if self.use_lancedb and self.lancedb_table is not None:
@@ -553,8 +662,8 @@ class VideoSearchEngine:
         if use_rrf:
             k_val = max(1, int(rrf_k))
             
-            # Xếp hạng từng kênh độc lập
-            if has_visual:
+            # Xếp hạng từng kênh độc lập dựa trên tín hiệu được chọn
+            if has_visual and rrf_use_visual:
                 vis_cands = sorted([c for c in candidates_list if c["score_visual"] > 0], key=lambda x: x["score_visual"], reverse=True)
                 for r_idx, c in enumerate(vis_cands):
                     c["rank_vis"] = r_idx + 1
@@ -564,7 +673,7 @@ class VideoSearchEngine:
                 for r_idx, c in enumerate(ocr_cands):
                     c["rank_ocr"] = r_idx + 1
 
-            if has_speech:
+            if has_speech and rrf_use_asr:
                 asr_cands = sorted([c for c in candidates_list if c["score_asr"] > 0], key=lambda x: x["score_asr"], reverse=True)
                 for r_idx, c in enumerate(asr_cands):
                     c["rank_asr"] = r_idx + 1
@@ -574,22 +683,39 @@ class VideoSearchEngine:
                 for r_idx, c in enumerate(obj_cands):
                     c["rank_obj"] = r_idx + 1
 
+            # Bảng tra thứ hạng Video Shot (nếu bật rrf_use_shot)
+            shot_rank_map = {}
+            if rrf_use_shot and shot_cands:
+                for r_idx, sc in enumerate(shot_cands):
+                    shot_rank_map[sc["shot_id"]] = r_idx + 1
+
             raw_rrf_scores = []
             for cand in candidates_list:
                 score = 0.0
-                if "rank_vis" in cand and has_visual:
+                if "rank_vis" in cand and has_visual and rrf_use_visual:
                     score += 1.0 / (k_val + cand["rank_vis"])
                 if "rank_ocr" in cand and has_ocr:
                     score += 1.0 / (k_val + cand["rank_ocr"])
-                if "rank_asr" in cand and has_speech:
+                if "rank_asr" in cand and has_speech and rrf_use_asr:
                     score += 1.0 / (k_val + cand["rank_asr"])
                 if "rank_obj" in cand and has_object:
                     score += 1.0 / (k_val + cand["rank_obj"])
 
+                # Điểm đóng góp từ Video Shot
+                if rrf_use_shot and shot_rank_map:
+                    cand_shot_id = self.kf_shot_map.get(cand["path"])
+                    if not cand_shot_id:
+                        p_parts = cand["path"].split("/")
+                        cand_shot_id = self.kf_shot_map.get(f"{p_parts[0]}/{p_parts[1].replace('.jpg','')}")
+                    if cand_shot_id and cand_shot_id in shot_rank_map:
+                        score += 1.0 / (k_val + shot_rank_map[cand_shot_id])
+                        cand["rank_shot"] = shot_rank_map[cand_shot_id]
+
                 # Bonus cộng điểm cho frame khớp nhiều kênh đồng thời
                 match_channels = (1 if cand["score_visual"] > 0.15 else 0) + \
                                  (1 if cand["score_asr"] > 0.15 else 0) + \
-                                 (1 if cand["score_obj"] > 0.3 else 0)
+                                 (1 if cand["score_obj"] > 0.3 else 0) + \
+                                 (1 if "rank_shot" in cand else 0)
                 if match_channels >= 2:
                     score *= 1.25
 
@@ -779,7 +905,14 @@ class VideoSearchEngine:
             asr_et = sp_exp.get("end", 0.0) if sp_exp.get("end") else r.get("speech_end", 0.0)
             asr_prev = sp_exp.get("prev_text", "")
             asr_next = sp_exp.get("next_text", "")
-            asr_all = sp_exp.get("all_context", "")
+            # Lấy thông tin Video Shot tương ứng với Keyframe này
+            cand_shot_id = self.kf_shot_map.get(r["path"])
+            if not cand_shot_id:
+                p_parts = r["path"].split("/")
+                cand_shot_id = self.kf_shot_map.get(f"{p_parts[0]}/{p_parts[1].replace('.jpg','')}")
+            
+            shot_meta = self.shot_meta_map.get(cand_shot_id, {}) if cand_shot_id else {}
+            cut_file = shot_meta.get("cut_file", "")
 
             formatted_results.append({
                 "video_id": v_id,
@@ -794,13 +927,101 @@ class VideoSearchEngine:
                 "asr_transcript": transcript,
                 "asr_prev": asr_prev,
                 "asr_next": asr_next,
-                "asr_all": asr_all,
+                "asr_all": sp_exp.get("all_text", transcript),
                 "asr_start": asr_st,
                 "asr_end": asr_et,
-                "boxes": boxes
+                "boxes": boxes,
+                # Thông tin Video Shot gắn liền với khoảnh khắc Top-K
+                "shot_id": cand_shot_id,
+                "cut_file": cut_file,
+                "shot_start_sec": shot_meta.get("start_sec", 0.0),
+                "shot_end_sec": shot_meta.get("end_sec", 0.0),
+                "shot_duration_sec": shot_meta.get("duration_sec", 0.0),
+                "shot_index": shot_meta.get("shot_index", 1),
+                # Minh bạch thứ hạng từng kênh thành phần (Transparency Ranks)
+                "rank_vis": r.get("rank_vis"),
+                "rank_asr": r.get("rank_asr"),
+                "rank_shot": r.get("rank_shot"),
+                "rank_ocr": r.get("rank_ocr"),
+                "rank_obj": r.get("rank_obj")
             })
 
-        print(f"[SearchEngine] ⏱️ Truy vấn hoàn tất trong {time.time() - t0:.3f}s | Trả về {len(formatted_results)} results.")
+        # Định dạng danh sách Video Shots (nếu return_shots=True)
+        formatted_shot_results = []
+        if return_shots:
+            shot_scores = {}
+            shot_best_kf = {}
+            k_val = max(1, int(rrf_k))
+
+            # 1. Điểm từ Video Shot vector search trực tiếp
+            if rrf_use_shot and shot_cands:
+                for r_idx, sc in enumerate(shot_cands):
+                    s_id = sc["shot_id"]
+                    shot_scores[s_id] = shot_scores.get(s_id, 0.0) + 1.0 / (k_val + r_idx + 1)
+
+            # 2. Điểm từ Keyframe matches (Visual, ASR)
+            for cand in candidates_list:
+                s_id = self.kf_shot_map.get(cand["path"])
+                if not s_id:
+                    p_parts = cand["path"].split("/")
+                    s_id = self.kf_shot_map.get(f"{p_parts[0]}/{p_parts[1].replace('.jpg','')}")
+                if not s_id:
+                    continue
+
+                if s_id not in shot_best_kf or cand.get("final_score", 0) > shot_best_kf[s_id].get("final_score", 0):
+                    shot_best_kf[s_id] = cand
+
+                if use_rrf:
+                    if rrf_use_visual and "rank_vis" in cand:
+                        shot_scores[s_id] = shot_scores.get(s_id, 0.0) + 1.0 / (k_val + cand["rank_vis"])
+                    if rrf_use_asr and "rank_asr" in cand:
+                        shot_scores[s_id] = shot_scores.get(s_id, 0.0) + 1.0 / (k_val + cand["rank_asr"])
+                else:
+                    shot_scores[s_id] = max(shot_scores.get(s_id, 0.0), cand.get("final_score", 0.0))
+
+            sorted_shots = sorted(shot_scores.items(), key=lambda x: x[1], reverse=True)
+            max_s_score = sorted_shots[0][1] if sorted_shots else 1.0
+            if max_s_score <= 0:
+                max_s_score = 1.0
+
+            for s_id, raw_s_score in sorted_shots[:top_k]:
+                meta = self.shot_meta_map.get(s_id, {})
+                v_id = meta.get("video_id", s_id.split("_shot_")[0])
+                b_kf = shot_best_kf.get(s_id)
+
+                b_kf_frame_id = ""
+                b_kf_path = ""
+                if b_kf:
+                    b_kf_path = b_kf.get("path", "")
+                    b_kf_frame_id = b_kf_path.split("/")[1].replace(".jpg", "") if "/" in b_kf_path else ""
+                else:
+                    anchor = meta.get("anchor_frame_id", 0)
+                    b_kf_frame_id = str(anchor).zfill(6)
+                    b_kf_path = f"{v_id}/{b_kf_frame_id}.jpg"
+
+                cut_file = meta.get("cut_file", "")
+                norm_score = round(raw_s_score / max_s_score, 4)
+
+                formatted_shot_results.append({
+                    "shot_id": s_id,
+                    "video_id": v_id,
+                    "shot_index": meta.get("shot_index", 1),
+                    "start_sec": meta.get("start_sec", 0.0),
+                    "end_sec": meta.get("end_sec", 0.0),
+                    "duration_sec": meta.get("duration_sec", 0.0),
+                    "anchor_frame_id": meta.get("anchor_frame_id", 0),
+                    "cut_file": cut_file,
+                    "score": norm_score,
+                    "best_kf_frame_id": b_kf_frame_id,
+                    "best_kf_path": b_kf_path
+                })
+
+        print(f"[SearchEngine] ⏱️ Truy vấn hoàn tất trong {time.time() - t0:.3f}s | Trả về {len(formatted_results)} KFs, {len(formatted_shot_results)} Shots.")
+        if return_shots:
+            return {
+                "results": formatted_results,
+                "shot_results": formatted_shot_results
+            }
         return formatted_results
 
     def search_multi_scene(
@@ -835,11 +1056,16 @@ class VideoSearchEngine:
         include_videos: Optional[List[str]] = None,
         exclude_videos: Optional[List[str]] = None,
         category: str = "",
-        sub_category: str = ""
+        sub_category: str = "",
+        rrf_use_visual: bool = True,
+        rrf_use_asr: bool = True,
+        rrf_use_shot: bool = True,
+        return_shots: bool = True
     ) -> Dict[str, Any]:
         """
         Truy vấn Đa Phân Cảnh (Multi-Scene / TRAKE Temporal Query Decomposition & Video Voting).
         Tích hợp thuật toán TARS Monotonic DP (Prefix-Maximum Recurrence & Alpha Fusion chuẩn AIC 2025/2026).
+        Hỗ trợ toàn diện Multimodal + RRF Đa Tín Hiệu (Visual / ASR / Shot) và ánh xạ Shot cho từng sự kiện.
         """
         t0 = time.time()
         if not scenes:
@@ -884,7 +1110,7 @@ class VideoSearchEngine:
             sc_obj_id = sc_obj_dict.get("class_id") if (enable_object and sc_obj_dict) else object_class_id
             sc_obj_thresh = sc_obj_dict.get("min_confidence", object_conf_thresh) if (enable_object and sc_obj_dict) else object_conf_thresh
 
-            sc_results = self.search(
+            search_out = self.search(
                 query_text=sc_vis,
                 ocr_query=sc_ocr,
                 speech_query=sc_asr,
@@ -908,14 +1134,26 @@ class VideoSearchEngine:
                 use_rrf=use_rrf,
                 rrf_k=rrf_k,
                 asr_window_n=asr_window_n,
-                query_vec=sc_vec
+                query_vec=sc_vec,
+                rrf_use_visual=rrf_use_visual,
+                rrf_use_asr=rrf_use_asr,
+                rrf_use_shot=rrf_use_shot,
+                return_shots=return_shots
             )
+
+            if isinstance(search_out, dict):
+                sc_results = search_out.get("results", [])
+                sc_shots = search_out.get("shot_results", [])
+            else:
+                sc_results = search_out
+                sc_shots = []
 
             scene_outputs.append({
                 "scene_idx": sc.get("scene_idx", s_idx + 1),
                 "name": sc.get("name", f"Cảnh {s_idx + 1}"),
                 "visual_query": sc_vis,
-                "results": sc_results
+                "results": sc_results,
+                "shot_results": sc_shots
             })
 
             # Tích lũy điểm số theo video cho phân cảnh này
@@ -1031,6 +1269,21 @@ class VideoSearchEngine:
                     
                     item_dict = dict(f)
                     item_dict["delta_t_to_next"] = delta_t
+
+                    # Ánh xạ Video Shot tương ứng cho event này
+                    s_id = self.kf_shot_map.get(f.get("keyframe", ""))
+                    if not s_id:
+                        s_id = self.kf_shot_map.get(f"{f.get('video_id', '')}/{f.get('frame_id', '')}")
+                    if s_id:
+                        meta = self.shot_meta_map.get(s_id, {})
+                        item_dict["shot_id"] = s_id
+                        item_dict["shot_index"] = meta.get("shot_index", 1)
+                        item_dict["shot_start_sec"] = meta.get("start_sec", 0.0)
+                        item_dict["shot_end_sec"] = meta.get("end_sec", 0.0)
+                        item_dict["shot_duration_sec"] = meta.get("duration_sec", 0.0)
+                        item_dict["cut_file"] = meta.get("cut_file", "")
+                        item_dict["anchor_frame_id"] = meta.get("anchor_frame_id", f.get("frame_id"))
+
                     formatted_items.append(item_dict)
 
                 # Format dòng CSV nộp bài chuẩn: <video_id>,<F_E1>,<F_E2>,...

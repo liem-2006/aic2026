@@ -77,5 +77,19 @@ DEFAULT_OBJECT_THRESHOLD = 0.3
 ASR_MAPPING_PATH = os.path.join(DATA_DIR, "asr_mapping.json")
 FPS_MAPPING_PATH = os.path.join(DATA_DIR, "video_fps_mapping.json")
 
+# --- VIDEO SHOTS & MAPPING (Qwen3-VL Video 2048D) ---
+VIDEO_SHOT_TABLE = "video_shots"
+KF_SHOT_MAP_PATH = os.path.join(DATA_DIR, "kf_shot_map.json")
+SHOT_METADATA_MAP_PATH = os.path.join(DATA_DIR, "shot_metadata_map.json")
+
+# Thư mục chứa video phân cảnh đã cắt (.mp4 con)
+if os.path.exists(os.path.join(DATA_DIR, "batch 1", "output-video-encode", "cut_videos")):
+    CUT_VIDEOS_BASE = os.path.join(DATA_DIR, "batch 1", "output-video-encode", "cut_videos")
+elif os.path.exists(os.path.join(DATA_DIR, "cut_videos")):
+    CUT_VIDEOS_BASE = os.path.join(DATA_DIR, "cut_videos")
+else:
+    CUT_VIDEOS_BASE = os.path.join(DATA_DIR, "batch 1", "output-video-encode", "cut_videos")
+
 # --- GEMINI API KEY (MẶC ĐỊNH CHO AIC 2026) ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+

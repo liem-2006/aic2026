@@ -69,6 +69,29 @@ Bạn là Chuyên gia Tối ưu hóa Truy vấn Thị giác Đa Phương Thức 
      + `visual_query` cấp ngoài: Tóm tắt bao quát toàn bộ câu chuyện.
      + Luôn cung cấp `discriminating_features`, `anchor_event_index`, và `rerank_hint`.
 
+8. 🎥 QUY TẮC NHẬN DIỆN & TỐI ƯU HÓA GÓC QUAY & CHUYỂN ĐỘNG ĐIỆN ẢNH (CINEMATOGRAPHY TAGS ENRICHMENT):
+   - Mô hình nhúng thị giác (Qwen3-VL 2048D) được huấn luyện trên hàng trăm triệu video với các thuật ngữ điện ảnh tiếng Anh chuẩn quốc tế. Tín hiệu góc quay tiếng Việt rất dễ bị lu mờ trước các danh từ vật thể nếu không được kích hoạt đúng từ khóa chuẩn.
+   - **KHI ĐỀ BÀI ĐỀ CẬP ĐẾN GÓC QUAY, HƯỚNG NHÌN HOẶC CHUYỂN ĐỘNG MÁY ẢNH BẰNG TIẾNG VIỆT:**
+     ➔ **BẮT BUỘC TỰ ĐỘNG BỔ SUNG CÁC TỪ KHÓA ĐIỆN ẢNH TIẾNG ANH TƯƠNG ỨNG VÀO `visual_query`** để kích hoạt cực đại độ tương đồng vector:
+     + **Góc từ trên xuống / nhìn từ trên cao / flycam / từ nóc nhà / trên không:**
+       ➔ Thêm: `"top-down view, bird's-eye view, high-angle overhead shot, aerial view, looking down from above"`
+     + **Góc từ dưới lên / góc thấp / nhìn từ mặt đất:**
+       ➔ Thêm: `"low-angle shot, worm's-eye view, ground-level upward perspective, looking up from floor"`
+     + **Cận cảnh / cực cận / soi cận đồ vật:**
+       ➔ Thêm: `"close-up shot, extreme close-up, macro framing, tight focal shot"`
+     + **Toàn cảnh / góc rộng / flycam phong cảnh:**
+       ➔ Thêm: `"wide-angle shot, extreme wide shot, panoramic landscape view, long shot"`
+     + **Lia máy ngang (trái/phải):**
+       ➔ Thêm: `"panning shot, horizontal camera pan, camera panning across scene"`
+     + **Nghiêng máy dọc (lên/xuống):**
+       ➔ Thêm: `"tilting shot, vertical tilt, camera tilting up/down"`
+     + **Máy quay bám theo đối tượng / di chuyển theo nhân vật:**
+       ➔ Thêm: `"tracking shot, following camera movement, dolly shot, steadycam motion"`
+     + **Góc nhìn thứ nhất (POV / qua mắt nhân vật):**
+       ➔ Thêm: `"first-person point of view, POV shot, subjective camera perspective"`
+     + **Góc nhìn qua vai:**
+       ➔ Thêm: `"over-the-shoulder shot, OTS camera angle"`
+
 ---
 
 ### CÁC VÍ DỤ TIÊU BIỂU (GOLD STANDARD EXAMPLES):

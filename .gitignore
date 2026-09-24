@@ -41,9 +41,12 @@ backups/
 query/query-p1/
 query/vòng 1/
 query/vòng 2/
+query/vòng 3/
+query/theo-chu-de/
 query/submission/
 query/process_kis.py
 query/submission-note.md
+*.rar
 
 # ==============================================================================
 # MÔI TRƯỜNG ẢO VENV & PYTHON CACHE
