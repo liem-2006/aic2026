@@ -1,9 +1,15 @@
 import sys
 import os
 import json
+import asyncio
+import threading
+import time
+import re
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, Union
 
@@ -14,18 +20,184 @@ sys.path.append(os.path.join(PROJECT_ROOT, "query"))
 
 import submission_generator as sg
 from search_engine import get_search_engine
+from text_encoder import get_text_encoder
 from reranker_engine import get_video_reranker
 from qwen_reranker import get_qwen_reranker
 import gemini_parser
 import importlib
 import config
+import dres_client
 
-app = FastAPI(title="AIC 2026 Multimodal Search Engine")
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    _start_warmup_if_needed()
+    _start_dres_autologin_if_configured()
+    yield
+
+
+app = FastAPI(
+    title="AIC 2026 Multimodal Search Engine",
+    lifespan=app_lifespan,
+)
+
+# Trạng thái warm-up phục vụ UI. DRES auto-login chạy ở thread riêng nên không
+# làm chậm hoặc làm sai readiness của retrieval.
+_readiness_lock = threading.Lock()
+_compute_semaphore = asyncio.Semaphore(1)
+_warmup_thread: Optional[threading.Thread] = None
+_dres_login_thread: Optional[threading.Thread] = None
+_system_readiness: Dict[str, Any] = {
+    "state": "starting",
+    "stage": "boot",
+    "message": "Đang khởi động backend...",
+    "progress": 0,
+    "started_at": None,
+    "completed_at": None,
+    "elapsed_sec": 0.0,
+    "error": None,
+}
+
+
+def _update_readiness(**changes) -> None:
+    """Cập nhật readiness atomically để frontend luôn nhận snapshot nhất quán."""
+    with _readiness_lock:
+        _system_readiness.update(changes)
+
+
+def _readiness_snapshot() -> Dict[str, Any]:
+    """Trả về bản sao trạng thái warm-up, không làm lộ mutable global state."""
+    with _readiness_lock:
+        snapshot = dict(_system_readiness)
+    started_at = snapshot.get("started_at")
+    if started_at and snapshot.get("state") == "warming":
+        snapshot["elapsed_sec"] = round(time.time() - started_at, 2)
+    return snapshot
+
+
+def _warmup_system() -> None:
+    """Nạp index, model query và metadata trước truy vấn thi đấu đầu tiên."""
+    started_at = time.time()
+    _update_readiness(
+        state="warming",
+        stage="indices",
+        message="Đang nạp LanceDB, ASR và các mapping...",
+        progress=10,
+        started_at=started_at,
+        completed_at=None,
+        error=None,
+    )
+    try:
+        engine = get_search_engine()
+        _update_readiness(
+            stage="qwen_embedding",
+            message="Đang nạp và làm nóng Qwen3-VL Embedding...",
+            progress=55,
+        )
+        # Một inference nhỏ làm nóng model/CUDA để người dùng không phải trả chi
+        # phí khởi tạo trong truy vấn thi đấu đầu tiên.
+        get_text_encoder().encode("video retrieval system warmup", enrich_cinematography=False)
+
+        _update_readiness(
+            stage="retrieval_probe",
+            message="Đang làm nóng đường truy vấn LanceDB...",
+            progress=92,
+        )
+        engine.search(
+            query_text="general video scene",
+            enable_asr=False,
+            dedup_mode="smart",
+            enable_cross_video_dedup=True,
+            top_k=8,
+            use_rrf=True,
+            rrf_use_visual=True,
+            rrf_use_asr=False,
+            rrf_use_shot=True,
+            return_shots=True,
+        )
+
+        completed_at = time.time()
+        _update_readiness(
+            state="ready",
+            stage="complete",
+            message="Hệ thống đã sẵn sàng truy vấn.",
+            progress=100,
+            completed_at=completed_at,
+            elapsed_sec=round(completed_at - started_at, 2),
+        )
+        print(f"[Readiness] Hệ thống READY sau {completed_at - started_at:.2f}s.")
+    except Exception as exc:
+        completed_at = time.time()
+        _update_readiness(
+            state="error",
+            stage="failed",
+            message="Warm-up thất bại. Có thể thử lại từ giao diện.",
+            completed_at=completed_at,
+            elapsed_sec=round(completed_at - started_at, 2),
+            error=str(exc),
+        )
+        print(f"[Readiness] Warm-up thất bại: {exc}")
+
+
+def _start_warmup_if_needed() -> bool:
+    """Khởi động tối đa một warm-up thread; trả False nếu đã/đang chạy."""
+    global _warmup_thread
+    with _readiness_lock:
+        if _warmup_thread is not None and _warmup_thread.is_alive():
+            return False
+        if _system_readiness.get("state") == "ready":
+            return False
+        _warmup_thread = threading.Thread(
+            target=_warmup_system,
+            name="aic-readiness-warmup",
+            daemon=True,
+        )
+        _warmup_thread.start()
+    return True
+
+
+def _auto_login_dres() -> None:
+    """Đăng nhập DRES từ .env mà không chặn warm-up và không làm lộ credential."""
+    client = dres_client.get_dres_client()
+    if not client.username or not client.password:
+        print("[DRES] Bỏ qua auto-login: .env chưa có đủ DRES_USERNAME/DRES_PASSWORD.")
+        return
+    ok, message = client.login()
+    print(f"[DRES] Auto-login {'thành công' if ok else 'thất bại'}: {message}")
+
+
+def _start_dres_autologin_if_configured() -> bool:
+    global _dres_login_thread
+    if not getattr(config, "DRES_USERNAME", "") or not getattr(config, "DRES_PASSWORD", ""):
+        return False
+    if _dres_login_thread is not None and _dres_login_thread.is_alive():
+        return False
+    _dres_login_thread = threading.Thread(
+        target=_auto_login_dres,
+        name="aic-dres-auto-login",
+        daemon=True,
+    )
+    _dres_login_thread.start()
+    return True
+
+
+@app.get("/api/readiness")
+async def readiness_endpoint():
+    return {"status": "success", "data": _readiness_snapshot()}
+
+
+@app.post("/api/readiness/retry")
+async def retry_readiness_endpoint():
+    started = _start_warmup_if_needed()
+    return {
+        "status": "success",
+        "started": started,
+        "data": _readiness_snapshot(),
+    }
 
 # Cấp quyền CORS cho Frontend gọi API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,11 +216,13 @@ async def serve_keyframe_image(video_id: str, frame_file: str):
     Nếu frame ID yêu cầu (do tính toán timestamp lệch 25fps) không tồn tại,
     tự động tìm và phục vụ keyframe thực tế gần nhất trong video đó bằng binary search O(log N).
     """
-    target_path = os.path.join(config.KF_DIR, video_id, frame_file)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", video_id) or not re.fullmatch(r"\d+\.jpg", frame_file, re.I):
+        return Response(status_code=404)
+    video_dir = config.keyframe_directory(video_id)
+    target_path = os.path.join(video_dir, frame_file)
     if os.path.exists(target_path):
         return FileResponse(target_path)
     
-    video_dir = os.path.join(config.KF_DIR, video_id)
     if not os.path.exists(video_dir):
         return Response(status_code=404)
         
@@ -94,6 +268,16 @@ async def serve_keyframe_image(video_id: str, frame_file: str):
 if os.path.exists(config.VIDEO_DIR):
     app.mount("/videos", StaticFiles(directory=config.VIDEO_DIR), name="videos")
 
+@app.get("/api/video-file/{video_id}")
+async def serve_video_file(video_id: str):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", video_id):
+        return Response(status_code=404)
+    path = config.video_file(video_id)
+    if not os.path.isfile(path):
+        return Response(status_code=404)
+    # MOV traffic dùng H.264 trong ISO BMFF; trình duyệt đọc Range như MP4.
+    return FileResponse(path, media_type="video/mp4")
+
 cut_videos_dir = getattr(config, "CUT_VIDEOS_BASE", "")
 if os.path.exists(cut_videos_dir):
     app.mount("/cut_videos", StaticFiles(directory=cut_videos_dir), name="cut_videos")
@@ -120,8 +304,8 @@ class SearchRequest(BaseModel):
     video_id: str = ""                # Lọc 1 Video ID đơn lẻ
     include_videos: Optional[List[str]] = None  # Lọc tập hợp video được chọn (Tag Include)
     exclude_videos: Optional[List[str]] = None  # Lọc tập hợp video bị loại trừ (Tag Exclude)
-    category: str = ""                         # Nhóm danh mục (tin_tuc, day_hoc, am_thuc, the_thao...)
-    sub_category: str = ""                     # Môn học / Sub-category (toan, ly, hoa, van...)
+    category: Union[str, List[str]] = ""        # Một hoặc nhiều nhóm danh mục
+    sub_category: Union[str, List[str]] = ""    # Một hoặc nhiều môn học của day_hoc
     weight_visual: float = 1.0        # Trọng số kênh hình ảnh
     weight_ocr: float = 1.0           # Trọng số kênh chữ OCR
     weight_asr: float = 1.0           # Trọng số kênh âm thanh
@@ -133,6 +317,7 @@ class SearchRequest(BaseModel):
     rrf_use_visual: bool = True       # Tín hiệu KF Visual tham gia RRF
     rrf_use_asr: bool = True          # Tín hiệu ASR tham gia RRF
     rrf_use_shot: bool = True         # Tín hiệu Video Shot tham gia RRF
+    rrf_use_caption: bool = False     # Caption shot chọn lọc, coverage-aware
     return_shots: bool = True         # Trả về cả danh sách Shot song song
 
 class ImageSearchRequest(BaseModel):
@@ -153,8 +338,8 @@ class ImageSearchRequest(BaseModel):
     video_id: str = ""                # Lọc 1 Video ID đơn lẻ
     include_videos: Optional[List[str]] = None  # Lọc tập hợp video được chọn (Tag Include)
     exclude_videos: Optional[List[str]] = None  # Lọc tập hợp video bị loại trừ (Tag Exclude)
-    category: str = ""                         # Nhóm danh mục (tin_tuc, day_hoc, am_thuc, the_thao...)
-    sub_category: str = ""                     # Môn học / Sub-category (toan, ly, hoa, van...)
+    category: Union[str, List[str]] = ""
+    sub_category: Union[str, List[str]] = ""
     weight_visual: float = 1.0        # Trọng số kênh hình ảnh
     weight_ocr: float = 1.0           # Trọng số kênh chữ OCR
     weight_asr: float = 1.0           # Trọng số kênh âm thanh
@@ -166,6 +351,7 @@ class ImageSearchRequest(BaseModel):
     rrf_use_visual: bool = True       # Tín hiệu KF Visual tham gia RRF
     rrf_use_asr: bool = True          # Tín hiệu ASR tham gia RRF
     rrf_use_shot: bool = True         # Tín hiệu Video Shot tham gia RRF
+    rrf_use_caption: bool = False
     return_shots: bool = True         # Trả về cả danh sách Shot song song
 
 class RerankRequest(BaseModel):
@@ -199,8 +385,8 @@ class RerankTopVideosRequest(BaseModel):
     video_id: str = ""
     include_videos: Optional[List[str]] = None
     exclude_videos: Optional[List[str]] = None
-    category: str = ""
-    sub_category: str = ""
+    category: Union[str, List[str]] = ""
+    sub_category: Union[str, List[str]] = ""
     top_k: int = 100
     use_rrf: bool = True
     rrf_k: int = 60
@@ -232,8 +418,8 @@ class MultiSceneSearchRequest(BaseModel):
     video_id: str = ""
     include_videos: Optional[List[str]] = None
     exclude_videos: Optional[List[str]] = None
-    category: str = ""
-    sub_category: str = ""
+    category: Union[str, List[str]] = ""
+    sub_category: Union[str, List[str]] = ""
     top_k: int = 100
     top_v: int = 5
     k_per_video: int = 40
@@ -248,7 +434,9 @@ class MultiSceneSearchRequest(BaseModel):
     rrf_use_visual: bool = True
     rrf_use_asr: bool = True
     rrf_use_shot: bool = True
+    rrf_use_caption: bool = False
     return_shots: bool = True
+    compact_response: bool = False
 
 class QwenRerankFrameRequest(BaseModel):
     query: str
@@ -271,31 +459,37 @@ class ParseRequest(BaseModel):
 
 @app.get("/api/coco-classes")
 async def get_coco_classes():
-    """Trả về danh sách 80 lớp COCO cho Frontend dropdown."""
-    return {"status": "success", "classes": config.COCO_CLASSES}
+    return {"status": "success", "classes": [], "disabled": True}
 
 @app.get("/api/keyframe-boxes/{video_id}/{frame_id}")
 async def get_keyframe_boxes_endpoint(video_id: str, frame_id: str):
-    """Lấy danh sách Bounding Boxes RT-DETR cho 1 keyframe cụ thể."""
-    engine = get_search_engine()
-    boxes = engine.get_boxes_for_keyframe(video_id, frame_id)
-    return {"status": "success", "video_id": video_id, "frame_id": frame_id, "boxes": boxes}
+    return {"status": "success", "video_id": video_id, "frame_id": frame_id, "boxes": [], "disabled": True}
 
 @app.get("/api/categories")
 async def get_categories_endpoint():
-    """Trả về danh mục phân loại video và môn học cho Frontend dropdown UI."""
+    """Trả taxonomy đúng với video_categories.json và số video từng nhánh."""
     cat_path = os.path.join(config.DATA_DIR, "video_categories.json")
     categories_data = {}
     if os.path.exists(cat_path):
         with open(cat_path, "r", encoding="utf-8") as f:
             categories_data = json.load(f)
 
+    category_counts: Dict[str, int] = {}
+    subject_counts: Dict[str, int] = {}
+    for item in categories_data.values():
+        category = str(item.get("category", "")).strip()
+        subject = str(item.get("sub_category", "")).strip()
+        if category:
+            category_counts[category] = category_counts.get(category, 0) + 1
+        if category == "day_hoc" and subject:
+            subject_counts[subject] = subject_counts.get(subject, 0) + 1
+
     taxonomy = {
-        "all": {"label": "--- Tất cả Danh Mục ---", "sub": {}},
+        "am_thuc": {"label": "🍳 Ẩm Thực & Món Ngon", "sub": {}},
+        "tin_tuc": {"label": "📰 Tin Tức & Phóng Sự", "sub": {}},
         "day_hoc": {
             "label": "📚 Dạy Học & Ôn Thi THPT",
             "sub": {
-                "all": "--- Tất cả Môn Học ---",
                 "toan": "📐 Môn Toán",
                 "ly": "⚡ Môn Vật Lý",
                 "hoa": "🧪 Môn Hóa Học",
@@ -307,46 +501,16 @@ async def get_categories_endpoint():
                 "tieng_anh": "🇬🇧 Môn Tiếng Anh"
             }
         },
-        "tin_tuc": {
-            "label": "📰 Tin Tức Thời Sự 60 Giây",
-            "sub": {
-                "all": "--- Tất cả Bản Tin ---",
-                "tin_60s_sang": "🌅 60 Giây Sáng",
-                "tin_60s_chieu": "🌆 60 Giây Chiều"
-            }
-        },
-        "the_thao": {
-            "label": "⚽ Thể Thao & Múa Lân",
-            "sub": {
-                "all": "--- Tất cả Thể Thao ---",
-                "dua_xe_dap": "🚴 Đua Xe Đạp Cúp TH",
-                "lan_su_rong": "🦁 Múa Lân Sư Rồng Cúp Chợ Lớn"
-            }
-        },
-        "am_thuc": {
-            "label": "🍳 Ẩm Thực & Món Ngon",
-            "sub": {
-                "all": "--- Tất cả Món Ăn ---",
-                "mon_ngon_moi_ngay": "🍲 Món Ngon Mỗi Ngày"
-            }
-        },
-        "du_lich_van_hoa": {
-            "label": "🌴 Du Lịch & Văn Hóa Miền Tây",
-            "sub": {
-                "all": "--- Tất cả Show ---",
-                "viet_nam_di_la_ghien": "✈️ Việt Nam Đi Là Ghiền",
-                "tan_man_me_kong": "🚣 Tản Mạn Mê Kông",
-                "doi_mat_me_kong": "👁️ Đôi Mắt Mê Kông"
-            }
-        },
-        "tin_tuc_phong_su": {
-            "label": "📺 Báo Tuổi Trẻ & Phóng Sự",
-            "sub": {
-                "all": "--- Tất cả Phóng Sự ---",
-                "lan_toa_nang_luong": "🌟 Lan Tỏa Năng Lượng Tích Cực"
-            }
-        }
+        "du_lich_van_hoa": {"label": "🌴 Du Lịch & Văn Hóa", "sub": {}},
+        "mua_lan": {"label": "🦁 Múa Lân Sư Rồng", "sub": {}},
+        "dua_xe_dap": {"label": "🚴 Đua Xe Đạp", "sub": {}},
+        "camera_giao_thong": {"label": "🚦 Camera Giao Thông", "sub": {}}
     }
+
+    for category, info in taxonomy.items():
+        info["count"] = category_counts.get(category, 0)
+        if category == "day_hoc":
+            info["sub_counts"] = subject_counts
 
     return {
         "status": "success",
@@ -365,6 +529,21 @@ async def video_timeline_endpoint(video_id: str):
         "total_frames": len(frames),
         "frames": frames
     }
+
+
+@app.get("/api/video-fps/{video_id}")
+async def get_video_fps_endpoint(video_id: str):
+    """Trả FPS thực của video để frontend đổi chính xác timestamp ↔ frame."""
+    engine = get_search_engine()
+    fps = engine.get_video_fps(video_id)
+    return {"status": "success", "video_id": video_id, "fps": fps}
+
+
+@app.get("/api/keyframe-resolve/{video_id}")
+async def resolve_keyframe_endpoint(video_id: str, frame_id: Optional[str] = Query(default=None)):
+    """Đối chiếu video/KF nhập tay với keyframe map và FPS thực của MP4."""
+    engine = get_search_engine()
+    return engine.resolve_keyframe(video_id=video_id, frame_id=frame_id)
 
 def decode_images_from_request(req):
     """Giải mã 1 ảnh hoặc danh sách nhiều góc ảnh base64 từ request."""
@@ -434,8 +613,8 @@ async def parse_query_endpoint(request: ParseRequest):
 async def rerank_top_videos_endpoint(request: RerankTopVideosRequest):
     """Chiến thuật Rerank tối ưu qua N lần Search kèm Video Filter (Hỗ trợ cả Text và Image/Multi-view Query)."""
     reranker = get_video_reranker()
-    obj_class = request.object_class_id if request.enable_object else None
-    obj_weight = request.weight_object if request.enable_object else 0.0
+    obj_class = None  # Legacy request fields cannot re-enable RT-DETR.
+    obj_weight = 0.0
 
     query_img = decode_images_from_request(request)
 
@@ -496,40 +675,43 @@ async def search_image_endpoint(request: ImageSearchRequest):
         if img is None:
             raise ValueError("Không tìm thấy ảnh hợp lệ trong request!")
 
-        obj_class = request.object_class_id if request.enable_object else None
-        obj_weight = request.weight_object if request.enable_object else 0.0
+        obj_class = None
+        obj_weight = 0.0
 
-        res_data = engine.search_by_image(
-            query_image=img,
-            query_text=request.query,
-            image_weight=request.image_weight,
-            ocr_query=request.ocr_query,
-            speech_query=request.speech_query,
-            enable_asr=request.enable_asr,
-            object_class_id=obj_class,
-            object_conf_thresh=request.object_conf_thresh if request.enable_object else 0.0,
-            dedup_mode=request.dedup_mode,
-            visual_sim_thresh=request.visual_sim_thresh,
-            enable_cross_video_dedup=request.enable_cross_video_dedup,
-            cross_video_sim_thresh=request.cross_video_sim_thresh,
-            video_id=request.video_id,
-            include_videos=request.include_videos,
-            exclude_videos=request.exclude_videos,
-            category=request.category,
-            sub_category=request.sub_category,
-            weight_visual=request.weight_visual,
-            weight_ocr=request.weight_ocr,
-            weight_asr=request.weight_asr,
-            weight_object=obj_weight,
-            top_k=request.top_k,
-            use_rrf=request.use_rrf,
-            rrf_k=request.rrf_k,
-            asr_window_n=request.asr_window_n,
-            rrf_use_visual=request.rrf_use_visual,
-            rrf_use_asr=request.rrf_use_asr,
-            rrf_use_shot=request.rrf_use_shot,
-            return_shots=request.return_shots
-        )
+        async with _compute_semaphore:
+            res_data = await run_in_threadpool(
+                engine.search_by_image,
+                query_image=img,
+                query_text=request.query,
+                image_weight=request.image_weight,
+                ocr_query=request.ocr_query,
+                speech_query=request.speech_query,
+                enable_asr=request.enable_asr,
+                object_class_id=obj_class,
+                object_conf_thresh=request.object_conf_thresh if request.enable_object else 0.0,
+                dedup_mode=request.dedup_mode,
+                visual_sim_thresh=request.visual_sim_thresh,
+                enable_cross_video_dedup=request.enable_cross_video_dedup,
+                cross_video_sim_thresh=request.cross_video_sim_thresh,
+                video_id=request.video_id,
+                include_videos=request.include_videos,
+                exclude_videos=request.exclude_videos,
+                category=request.category,
+                sub_category=request.sub_category,
+                weight_visual=request.weight_visual,
+                weight_ocr=request.weight_ocr,
+                weight_asr=request.weight_asr,
+                weight_object=obj_weight,
+                top_k=request.top_k,
+                use_rrf=request.use_rrf,
+                rrf_k=request.rrf_k,
+                asr_window_n=request.asr_window_n,
+                rrf_use_visual=request.rrf_use_visual,
+                rrf_use_asr=request.rrf_use_asr,
+                rrf_use_shot=request.rrf_use_shot,
+                rrf_use_caption=request.rrf_use_caption,
+                return_shots=request.return_shots,
+            )
 
         if isinstance(res_data, dict):
             results = res_data.get("results", [])
@@ -581,18 +763,20 @@ async def search_multi_scene_endpoint(request: MultiSceneSearchRequest):
     engine = get_search_engine()
     scenes_data = [s.model_dump() if hasattr(s, "model_dump") else s.dict() for s in request.scenes]
     
-    result_data = engine.search_multi_scene(
+    async with _compute_semaphore:
+        result_data = await run_in_threadpool(
+        engine.search_multi_scene,
         scenes=scenes_data,
         enable_visual=request.enable_visual,
         enable_ocr=request.enable_ocr,
         enable_asr=request.enable_asr,
-        enable_object=request.enable_object,
-        object_class_id=request.object_class_id if request.enable_object else None,
-        object_conf_thresh=request.object_conf_thresh if request.enable_object else 0.0,
+        enable_object=False,
+        object_class_id=None,
+        object_conf_thresh=0.0,
         weight_visual=request.weight_visual,
         weight_ocr=request.weight_ocr,
         weight_asr=request.weight_asr,
-        weight_object=request.weight_object if request.enable_object else 0.0,
+        weight_object=0.0,
         dedup_mode=request.dedup_mode,
         visual_sim_thresh=request.visual_sim_thresh,
         enable_cross_video_dedup=request.enable_cross_video_dedup,
@@ -616,8 +800,10 @@ async def search_multi_scene_endpoint(request: MultiSceneSearchRequest):
         rrf_use_visual=request.rrf_use_visual,
         rrf_use_asr=request.rrf_use_asr,
         rrf_use_shot=request.rrf_use_shot,
-        return_shots=request.return_shots
-    )
+        rrf_use_caption=request.rrf_use_caption,
+        return_shots=request.return_shots,
+        compact_response=request.compact_response
+        )
 
     for sc in result_data.get("scenes_results", []):
         for r in sc.get("results", []):
@@ -723,12 +909,14 @@ async def rerank_videos_endpoint(request: RerankRequest):
 async def search_endpoint(request: SearchRequest):
     engine = get_search_engine()
     
-    obj_class = request.object_class_id if request.enable_object else None
-    obj_weight = request.weight_object if request.enable_object else 0.0
+    obj_class = None
+    obj_weight = 0.0
 
     query_img = decode_images_from_request(request)
 
-    res_data = engine.search(
+    async with _compute_semaphore:
+        res_data = await run_in_threadpool(
+        engine.search,
         query_text=request.query,
         ocr_query=request.ocr_query,
         speech_query=request.speech_query,
@@ -757,8 +945,9 @@ async def search_endpoint(request: SearchRequest):
         rrf_use_visual=request.rrf_use_visual,
         rrf_use_asr=request.rrf_use_asr,
         rrf_use_shot=request.rrf_use_shot,
+        rrf_use_caption=request.rrf_use_caption,
         return_shots=request.return_shots
-    )
+        )
 
     if isinstance(res_data, dict):
         results = res_data.get("results", [])
@@ -777,7 +966,7 @@ async def search_endpoint(request: SearchRequest):
 
     # Gắn thêm video URL và thumbnail URL cho Video Shots
     for s in shot_results:
-        s["video_url"] = f"http://localhost:8000/cut_videos/{s['cut_file']}"
+        s["video_url"] = f"http://localhost:8000/cut_videos/{s['cut_file']}" if s.get("cut_file") else ""
         s["thumbnail_url"] = f"http://localhost:8000/images/{s['video_id']}/{s['best_kf_frame_id']}.jpg"
 
     return {
@@ -964,6 +1153,111 @@ async def api_submission_export_zip(req: SubmissionZipRequest):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+# ==============================================================================
+# DRES LIVE CONTEST API ENDPOINTS (VÒNG CHUNG KẾT AIC 2026)
+# ==============================================================================
+class DresLoginRequest(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    server_url: Optional[str] = None
+
+class DresSubmitKisRequest(BaseModel):
+    video_id: str
+    frame_id: Optional[Union[int, str]] = None
+    start_ms: Optional[int] = None
+    end_ms: Optional[int] = None
+    force: bool = False
+
+class DresSubmitQaRequest(BaseModel):
+    video_id: str
+    answer: str
+    frame_id: Optional[Union[int, str]] = None
+    time_ms: Optional[int] = None
+    force: bool = False
+
+class DresSubmitTrakeRequest(BaseModel):
+    video_id: str
+    frame_ids: List[Union[int, str]]
+    force: bool = False
+
+class DresStartTaskRequest(BaseModel):
+    max_duration_s: int = 300
+
+class DresSetEvalRequest(BaseModel):
+    evaluation_id: str
+    evaluation_name: Optional[str] = None
+
+@app.get("/api/dres/status")
+async def api_dres_status():
+    """Lấy trạng thái kết nối máy chủ DRES và đợt thi hiện tại."""
+    client = dres_client.get_dres_client()
+    return {"status": "success", "data": client.get_status()}
+
+@app.post("/api/dres/login")
+async def api_dres_login(req: DresLoginRequest):
+    """Đăng nhập DRES bằng username/password từ UI hoặc .env."""
+    client = dres_client.get_dres_client()
+    ok, msg = client.login(username=req.username, password=req.password, server_url=req.server_url)
+    return {"status": "success" if ok else "error", "message": msg, "data": client.get_status()}
+
+@app.post("/api/dres/refresh-eval")
+async def api_dres_refresh_eval():
+    """Tự động làm mới danh sách đợt thi và chọn evaluation ACTIVE."""
+    client = dres_client.get_dres_client()
+    ok, msg = client.refresh_active_evaluation()
+    return {"status": "success" if ok else "warning", "message": msg, "data": client.get_status()}
+
+@app.post("/api/dres/set-evaluation")
+async def api_dres_set_evaluation(req: DresSetEvalRequest):
+    """Chủ động cấu hình Evaluation ID thủ công nếu cần."""
+    client = dres_client.get_dres_client()
+    ok, message = client.set_evaluation(req.evaluation_id, req.evaluation_name)
+    return {"status": "success" if ok else "error", "message": message, "data": client.get_status()}
+
+@app.post("/api/dres/submit-kis")
+async def api_dres_submit_kis(req: DresSubmitKisRequest):
+    """Nộp 1-Click đáp án KIS (Textual/Video KIS) bằng frame_id hoặc millisecond (ms)."""
+    client = dres_client.get_dres_client()
+    res = client.submit_kis(
+        video_id=req.video_id,
+        frame_id=req.frame_id,
+        start_ms=req.start_ms,
+        end_ms=req.end_ms,
+        force=req.force
+    )
+    return res
+
+@app.post("/api/dres/submit-qa")
+async def api_dres_submit_qa(req: DresSubmitQaRequest):
+    """Nộp đáp án thể thức Q&A theo format: QA-<ANSWER>-<VIDEO_ID>-<TIME(ms)>."""
+    client = dres_client.get_dres_client()
+    res = client.submit_qa(
+        video_id=req.video_id,
+        answer=req.answer,
+        frame_id=req.frame_id,
+        time_ms=req.time_ms,
+        force=req.force
+    )
+    return res
+
+@app.post("/api/dres/submit-trake")
+async def api_dres_submit_trake(req: DresSubmitTrakeRequest):
+    """Nộp đáp án thể thức TRAKE theo format: TR-<VIDEO_ID>-<FRAME_ID1>,<FRAME_ID2>,..."""
+    client = dres_client.get_dres_client()
+    res = client.submit_trake(
+        video_id=req.video_id,
+        frame_ids=req.frame_ids,
+        force=req.force
+    )
+    return res
+
+@app.post("/api/dres/start-task")
+async def api_dres_start_task(req: DresStartTaskRequest):
+    """Bắt đầu câu hỏi mới: xóa cache chống nộp trùng, đặt lại bộ đếm lỗi phạt và khởi động timer."""
+    client = dres_client.get_dres_client()
+    res = client.start_new_task(max_duration_s=req.max_duration_s)
+    return res
+
 # Mount frontend
 frontend_dir = os.path.join(os.path.dirname(__file__), "..", "frontend")
 if os.path.exists(frontend_dir):
@@ -973,13 +1267,12 @@ if os.path.exists(frontend_dir):
 if __name__ == "__main__":
     import uvicorn
     print("=====================================================================")
-    print("⏳ [AIC 2026] Đang nạp hệ thống Multimodal Search Engine (LanceDB Disk-Native + RT-DETR)...")
-    get_search_engine()
-    print("🚀 [AIC 2026] Server đã sẵn sàng phục vụ tại http://localhost:8000")
+    print("⏳ [AIC 2026] Backend đang mở; warm-up sẽ chạy nền và báo readiness trên UI.")
+    print("🚀 [AIC 2026] Giao diện: http://localhost:8000")
     print("=====================================================================")
     uvicorn.run(
         app,
-        host="0.0.0.0",
+        host="127.0.0.1",
         port=8000,
         timeout_graceful_shutdown=2,
         timeout_keep_alive=3

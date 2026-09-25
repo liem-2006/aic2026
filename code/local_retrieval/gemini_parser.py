@@ -411,7 +411,40 @@ def _fallback_smart_parser(raw_text: str) -> Dict[str, Any]:
 
     vis = _sanitize_visual_query(vis)
 
-    # 1. Kiểm tra TRAKE pattern E1:, E2:...
+    # 1. TRAKE shorthand: mỗi đoạn cách nhau bởi ít nhất một dòng trống là một event.
+    paragraph_events = [
+        _sanitize_visual_query(block.replace("\n", " "))
+        for block in re.split(r"\n[\t ]*\n+", cleaned)
+        if block.strip()
+    ]
+    if len(paragraph_events) >= 2:
+        scenes = []
+        for idx, event_text in enumerate(paragraph_events):
+            scenes.append({
+                "scene_idx": idx + 1,
+                "name": f"E{idx + 1}: {event_text[:30]}...",
+                "visual_query": event_text,
+                "ocr_query": "",
+                "speech_query": "",
+                "object_filter": obj_filter
+            })
+        return {
+            "task_type": "TRAKE",
+            "is_multi_scene": True,
+            "scenes": scenes,
+            "visual_query": "; ".join(paragraph_events),
+            "ocr_query": ocr_query,
+            "speech_query": "",
+            "object_filter": obj_filter,
+            "discriminating_features": discriminating,
+            "anchor_event_index": 0,
+            "rerank_hint": f"Quan sát chuỗi {len(scenes)} sự kiện tuần tự.",
+            "reranker_query": cleaned,
+            "qa_question": "",
+            "summary": f"Bóc tách TRAKE {len(scenes)} sự kiện từ các đoạn cách dòng."
+        }
+
+    # 2. Kiểm tra TRAKE pattern E1:, E2:...
     trake_matches = list(re.finditer(r'(E\d+)\s*:\s*(.+?)(?=(?:E\d+\s*:|$))', cleaned, re.DOTALL | re.IGNORECASE))
     if len(trake_matches) >= 2:
         # Lấy bối cảnh toàn cục trước E1 (nếu có)
@@ -452,7 +485,7 @@ def _fallback_smart_parser(raw_text: str) -> Dict[str, Any]:
             "summary": f"Bóc tách TRAKE {len(scenes)} sự kiện tự động (Fallback Parser)."
         }
 
-    # 2. Kiểm tra phân cảnh đa đoạn thông thường (sau đó, tiếp theo)
+    # 3. Kiểm tra phân cảnh đa đoạn thông thường (sau đó, tiếp theo)
     scenes = []
     is_multi_scene = False
     if "phân cảnh tiếp theo" in lower_t or "sau đó" in lower_t or "tiếp theo" in lower_t:

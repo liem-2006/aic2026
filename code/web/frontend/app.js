@@ -7,10 +7,18 @@ const RERANK_URL = "http://localhost:8000/api/rerank-top-videos";
 const MULTI_SCENE_URL = "http://localhost:8000/api/search-multi-scene";
 const QWEN_RERANK_CHAINS_URL = "http://localhost:8000/api/qwen-rerank-chains";
 const QWEN_STATUS_URL = "http://localhost:8000/api/qwen-status";
+const READINESS_URL = "http://localhost:8000/api/readiness";
+const READINESS_RETRY_URL = "http://localhost:8000/api/readiness/retry";
+const VIDEO_FPS_API = "http://localhost:8000/api/video-fps";
+const KEYFRAME_RESOLVE_API = "http://localhost:8000/api/keyframe-resolve";
 const SUBMISSION_FILL_URL = "http://localhost:8000/api/submission/fill";
 const SUBMISSION_SAVE_URL = "http://localhost:8000/api/submission/save-file";
 const SUBMISSION_LIST_URL = "http://localhost:8000/api/submission/list-files";
 const SUBMISSION_ZIP_URL = "http://localhost:8000/api/submission/export-zip";
+
+// Tính năng phụ vẫn được giữ ở backend nhưng ẩn khỏi luồng thao tác chung kết.
+const OCR_FEATURE_VISIBLE = false;
+const RERANK_FEATURE_VISIBLE = false;
 
 // Image Query Elements
 const cardImageQuery = document.getElementById("card-image-query");
@@ -174,9 +182,11 @@ const filterVideoResultsInput = document.getElementById("filter-video-results");
 
 // Module 6A: Danh Mục & Tags Filter Elements (Database Pushdown)
 const CATEGORIES_URL = "http://localhost:8000/api/categories";
+const cardCategoryFilter = document.getElementById("card-category-filter");
 const categorySelect = document.getElementById("category-select");
 const groupSubcategory = document.getElementById("group-subcategory");
 const subcategorySelect = document.getElementById("subcategory-select");
+const clearCategoryFilterBtn = document.getElementById("clear-category-filter");
 const includeTagsContainer = document.getElementById("include-tags-container");
 const includeVideoInput = document.getElementById("include-video-input");
 const excludeTagsContainer = document.getElementById("exclude-tags-container");
@@ -185,6 +195,14 @@ const excludeVideoInput = document.getElementById("exclude-video-input");
 let currentIncludeTags = [];
 let currentExcludeTags = [];
 let categoriesTaxonomy = {};
+let pendingCategorySelection = [];
+let pendingSubcategorySelection = [];
+
+// Đặt bộ lọc ngay dưới Visual Query mà không nhân đôi markup trong sidebar nhỏ.
+const visualCardForLayout = document.getElementById("card-visual");
+if (visualCardForLayout && cardCategoryFilter) {
+    visualCardForLayout.insertAdjacentElement("afterend", cardCategoryFilter);
+}
 
 // Cross-Video Dedup Elements (Chống QC/Intro lặp lại)
 const enableCrossVideoDedupCheck = document.getElementById("enable-cross-video-dedup-check");
@@ -198,40 +216,80 @@ const rerankBtn = document.getElementById("rerank-btn");
 const statusText = document.getElementById("status-text");
 const resultsGrid = document.getElementById("results-grid");
 const resultCount = document.getElementById("result-count");
+const systemReadiness = document.getElementById("system-readiness");
+const systemReadinessText = document.getElementById("system-readiness-text");
 
-// Dual-Mode View Elements (Keyframe View vs Video Shot View)
-const btnViewKf = document.getElementById("btn-view-kf");
-const btnViewShot = document.getElementById("btn-view-shot");
-let currentViewMode = localStorage.getItem("aic_view_mode") || "shot";
-let currentShotResults = [];
+let backendReady = false;
+let readinessPollTimer = null;
 
-function updateViewModeButtons() {
-    if (currentViewMode === "shot") {
-        if (btnViewShot) {
-            btnViewShot.style.background = "#0284c7";
-            btnViewShot.style.color = "white";
+function setSearchControlsReady(ready) {
+    backendReady = ready;
+    const hasRrfSignal = !useRrfCheck?.checked
+        || Boolean(rrfSignalVisual?.checked || rrfSignalAsr?.checked || rrfSignalShot?.checked);
+    if (searchBtn) searchBtn.disabled = !ready || !hasRrfSignal;
+    if (trakeSingleSearchBtn) trakeSingleSearchBtn.disabled = !ready;
+    if (trakeSearchBtn) trakeSearchBtn.disabled = !ready;
+    if (multiSearchBtn) multiSearchBtn.disabled = !ready || !isMultiSceneMode;
+}
+
+function renderReadinessState(data) {
+    const state = data?.state || "starting";
+    const progress = Number.isFinite(Number(data?.progress)) ? Number(data.progress) : 0;
+    const isReady = state === "ready";
+    setSearchControlsReady(isReady);
+
+    if (!systemReadiness || !systemReadinessText) return;
+    systemReadiness.classList.remove("readiness-warming", "readiness-ready", "readiness-error");
+
+    if (isReady) {
+        systemReadiness.classList.add("readiness-ready");
+        systemReadinessText.innerText = "READY";
+        systemReadiness.title = `Sẵn sàng sau ${data.elapsed_sec || 0}s`;
+        if (readinessPollTimer) {
+            clearInterval(readinessPollTimer);
+            readinessPollTimer = null;
         }
-        if (btnViewKf) {
-            btnViewKf.style.background = "transparent";
-            btnViewKf.style.color = "#94a3b8";
-        }
+    } else if (state === "error") {
+        systemReadiness.classList.add("readiness-error");
+        systemReadinessText.innerText = "WARM-UP ERROR";
+        systemReadiness.title = `${data.error || data.message || "Warm-up lỗi"} — click để thử lại`;
     } else {
-        if (btnViewKf) {
-            btnViewKf.style.background = "#3b82f6";
-            btnViewKf.style.color = "white";
-        }
-        if (btnViewShot) {
-            btnViewShot.style.background = "transparent";
-            btnViewShot.style.color = "#94a3b8";
-        }
+        systemReadiness.classList.add("readiness-warming");
+        systemReadinessText.innerText = `WARMING UP ${progress}%`;
+        systemReadiness.title = data.message || "Backend đang warm-up";
     }
 }
-updateViewModeButtons();
+
+async function fetchSystemReadiness() {
+    try {
+        const response = await fetch(READINESS_URL, { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        renderReadinessState(payload.data || {});
+    } catch (err) {
+        renderReadinessState({ state: "error", error: `Không đọc được readiness: ${err.message}` });
+    }
+}
+
+async function retrySystemWarmup() {
+    if (!systemReadiness?.classList.contains("readiness-error")) return;
+    renderReadinessState({ state: "warming", progress: 0, message: "Đang thử warm-up lại..." });
+    try {
+        await fetch(READINESS_RETRY_URL, { method: "POST" });
+        if (!readinessPollTimer) readinessPollTimer = setInterval(fetchSystemReadiness, 750);
+        await fetchSystemReadiness();
+    } catch (err) {
+        renderReadinessState({ state: "error", error: err.message });
+    }
+}
+
+if (systemReadiness) systemReadiness.addEventListener("click", retrySystemWarmup);
 
 // RRF Signal Selector Elements
 const rrfSignalVisual = document.getElementById("rrf-signal-visual");
 const rrfSignalAsr = document.getElementById("rrf-signal-asr");
 const rrfSignalShot = document.getElementById("rrf-signal-shot");
+const rrfSignalCaption = document.getElementById("rrf-signal-caption");
 
 if (rrfSignalVisual && localStorage.getItem("aic_rrf_visual") !== null) {
     rrfSignalVisual.checked = localStorage.getItem("aic_rrf_visual") === "true";
@@ -242,13 +300,17 @@ if (rrfSignalAsr && localStorage.getItem("aic_rrf_asr") !== null) {
 if (rrfSignalShot && localStorage.getItem("aic_rrf_shot") !== null) {
     rrfSignalShot.checked = localStorage.getItem("aic_rrf_shot") === "true";
 }
+if (rrfSignalCaption && localStorage.getItem("aic_rrf_caption") !== null) {
+    rrfSignalCaption.checked = localStorage.getItem("aic_rrf_caption") === "true";
+}
 
-[rrfSignalVisual, rrfSignalAsr, rrfSignalShot].forEach(el => {
+[rrfSignalVisual, rrfSignalAsr, rrfSignalShot, rrfSignalCaption].forEach(el => {
     if (el) {
         el.addEventListener("change", () => {
             if (rrfSignalVisual) localStorage.setItem("aic_rrf_visual", rrfSignalVisual.checked);
             if (rrfSignalAsr) localStorage.setItem("aic_rrf_asr", rrfSignalAsr.checked);
             if (rrfSignalShot) localStorage.setItem("aic_rrf_shot", rrfSignalShot.checked);
+            if (rrfSignalCaption) localStorage.setItem("aic_rrf_caption", rrfSignalCaption.checked);
             validateRrfSignals();
         });
     }
@@ -258,59 +320,13 @@ function validateRrfSignals() {
     const v = rrfSignalVisual ? rrfSignalVisual.checked : true;
     const a = rrfSignalAsr ? rrfSignalAsr.checked : true;
     const s = rrfSignalShot ? rrfSignalShot.checked : true;
-    if (!v && !a && !s) {
-        showToast("⚠️ Vui lòng bật ít nhất 1 tín hiệu RRF (Visual / ASR / Shot)!", "warning");
+    const c = rrfSignalCaption ? rrfSignalCaption.checked : false;
+    if (!v && !a && !s && !c) {
+        showToast("⚠️ Vui lòng bật ít nhất 1 tín hiệu RRF!", "warning");
         if (searchBtn) searchBtn.disabled = true;
     } else {
-        if (searchBtn) searchBtn.disabled = false;
+        if (searchBtn) searchBtn.disabled = !backendReady;
     }
-}
-
-function switchViewMode(mode) {
-    currentViewMode = mode;
-    localStorage.setItem("aic_view_mode", mode);
-    if (mode === "kf") {
-        if (btnViewKf) {
-            btnViewKf.style.background = "#3b82f6";
-            btnViewKf.style.color = "white";
-        }
-        if (btnViewShot) {
-            btnViewShot.style.background = "transparent";
-            btnViewShot.style.color = "#94a3b8";
-        }
-    } else {
-        if (btnViewShot) {
-            btnViewShot.style.background = "#0284c7";
-            btnViewShot.style.color = "white";
-        }
-        if (btnViewKf) {
-            btnViewKf.style.background = "transparent";
-            btnViewKf.style.color = "#94a3b8";
-        }
-    }
-
-    // NẾU ĐANG Ở CHẾ ĐỘ TRAKE: Chuyển đổi giữa Keyframe Storyboard vs Video Shot Storyboard
-    if (currentAppMode === "TRAKE") {
-        if (latestTrakeSequences && latestTrakeSequences.length > 0) {
-            if (resultCount) resultCount.innerText = `${latestTrakeSequences.length} sequences (TRAKE ${mode === 'kf' ? 'Keyframe' : 'Shot'} View)`;
-            renderTrakeStoryboard(latestTrakeSequences, mode);
-        }
-        return;
-    }
-
-    // NẾU ĐANG Ở CHẾ ĐỘ KIS / QA:
-    // CÙNG 1 DANH SÁCH TOP-K DUY NHẤT (Single Source of Truth), chỉ chuyển đổi cách hiển thị Video Shot vs Keyframe
-    if (currentResults && currentResults.length > 0) {
-        if (resultCount) resultCount.innerText = `${currentResults.length} kết quả Top-K (${mode === 'shot' ? '🎬 Video Shot' : '🖼️ Keyframe'} View)`;
-        renderResults(currentResults, mode);
-    }
-}
-
-if (btnViewKf) {
-    btnViewKf.addEventListener("click", () => switchViewMode("kf"));
-}
-if (btnViewShot) {
-    btnViewShot.addEventListener("click", () => switchViewMode("shot"));
 }
 
 // ==========================================================================
@@ -366,22 +382,7 @@ const copyStatus = document.getElementById("copy-status");
 const lightboxTranscript = document.getElementById("lightbox-transcript");
 const lightboxBoxesList = document.getElementById("lightbox-boxes-list");
 
-// Lightbox Video Shot Elements
-const lightboxMediaSwitcher = document.getElementById("lightbox-media-switcher");
-const btnLightboxModeShot = document.getElementById("btn-lightbox-mode-shot");
-const btnLightboxModeKf = document.getElementById("btn-lightbox-mode-kf");
-const lightboxShotBox = document.getElementById("lightbox-shot-box");
-const lightboxShotVideo = document.getElementById("lightbox-shot-video");
 const lightboxCanvasControls = document.getElementById("lightbox-canvas-controls");
-const lightboxShotControls = document.getElementById("lightbox-shot-controls");
-let currentLightboxMediaMode = "shot";
-
-if (btnLightboxModeShot) {
-    btnLightboxModeShot.addEventListener("click", () => setLightboxMediaMode("shot"));
-}
-if (btnLightboxModeKf) {
-    btnLightboxModeKf.addEventListener("click", () => setLightboxMediaMode("kf"));
-}
 
 // Timeline Elements
 const timelineModal = document.getElementById("timeline-modal");
@@ -402,6 +403,21 @@ const videoJumpKeyframe = document.getElementById("video-jump-keyframe");
 const videoForward5s = document.getElementById("video-forward-5s");
 const videoSpeedSelect = document.getElementById("video-speed-select");
 const videoCopyBtn = document.getElementById("video-copy-btn");
+const videoTrakeSubmitBtn = document.getElementById("video-trake-submit-btn");
+const videoModeHint = document.getElementById("video-mode-hint");
+const quickVideoOverlay = document.getElementById("quick-video-overlay");
+const quickVideoOpenBtn = document.getElementById("quick-video-open-btn");
+const quickVideoCloseBtn = document.getElementById("quick-video-close");
+const quickVideoIdInput = document.getElementById("quick-video-id-input");
+const quickVideoTimeInput = document.getElementById("quick-video-time-input");
+const btnQuickVideoGo = document.getElementById("btn-quick-video-go");
+const btnQuickVideoTimeline = document.getElementById("btn-quick-video-timeline");
+const btnQuickVideoSubmit = document.getElementById("btn-quick-video-submit");
+const quickSubmitMode = document.getElementById("quick-submit-mode");
+const quickVideoMapStatus = document.getElementById("quick-video-map-status");
+const quickVideoTabs = document.querySelectorAll(".quick-video-tab");
+const quickVideoVerifyPanel = document.getElementById("quick-video-verify-panel");
+const quickVideoSubmitPanel = document.getElementById("quick-video-submit-panel");
 
 // Global state
 let currentResults = [];
@@ -419,14 +435,50 @@ let activeSceneTabIdx = -1;
 let currentPlayingTimestamp = 0;
 let currentPlayingVideoId = "";
 let currentPlayingFrameId = "";
+const _videoFpsCache = Object.create(null);
+const _videoFpsRequests = Object.create(null);
+let _videoBadgeRafId = null;
+let _lastBadgeUpdate = 0;
+let _videoOutlineTimer = null;
+
+async function getVideoFpsWithCache(videoId) {
+    const normalizedId = String(videoId || "").trim().toUpperCase();
+    if (!normalizedId) return 25.0;
+    if (Object.prototype.hasOwnProperty.call(_videoFpsCache, normalizedId)) {
+        return _videoFpsCache[normalizedId];
+    }
+    if (_videoFpsRequests[normalizedId]) return _videoFpsRequests[normalizedId];
+
+    _videoFpsRequests[normalizedId] = (async () => {
+        try {
+            const response = await fetch(`${VIDEO_FPS_API}/${encodeURIComponent(normalizedId)}`);
+            if (!response.ok) throw new Error(`FPS API HTTP ${response.status}`);
+            const payload = await response.json();
+            const fps = Number(payload.fps);
+            _videoFpsCache[normalizedId] = Number.isFinite(fps) && fps > 0 ? fps : 25.0;
+        } catch (error) {
+            console.warn(`[VideoPlayer] Dùng FPS mặc định cho ${normalizedId}:`, error);
+            _videoFpsCache[normalizedId] = 25.0;
+        } finally {
+            delete _videoFpsRequests[normalizedId];
+        }
+        return _videoFpsCache[normalizedId];
+    })();
+
+    return _videoFpsRequests[normalizedId];
+}
 
 // TRAKE Mode States
 let currentAppMode = "KIS"; // "KIS" | "TRAKE"
 let latestTrakeSequences = [];
 let latestTrakeSubmissionLines = [];
+let trakeEnterStage = 0;
+let trakeDraftSignature = "";
+let trakeDraftSourceId = "";
 
 // ==========================================================================
-// CHUYỂN ĐỔI CHẾ ĐỘ: KIS / QA MODE <--> TRAKE MODE
+// CHUYỂN ĐỔI CHẾ ĐỘ TÌM KIẾM: KIS/MULTIMODAL <--> TRAKE
+// State này độc lập hoàn toàn với dresTaskModeSelect (thể thức nộp bài).
 // ==========================================================================
 function switchMode(mode, saveState = true) {
     currentAppMode = mode;
@@ -451,13 +503,28 @@ function switchMode(mode, saveState = true) {
             resultsMainTitle.innerText = "⏱️ TRAKE STORYBOARD MATRIX (TARS MONOTONIC DP)";
         }
 
-        // Nếu đã có kết quả TRAKE trước đó -> Render lại Storyboard Matrix theo view mode hiện tại
+        // Khôi phục draft khi người dùng quay lại tab TRAKE. Trước đây editor
+        // chỉ được render đúng lúc parse nên bị trống sau một vòng KIS -> TRAKE.
+        if (latestParsedScenes && latestParsedScenes.length >= 2) {
+            const geminiCard = document.getElementById("card-gemini");
+            setCardCollapsed(geminiCard, false);
+            if (multiSceneBar) multiSceneBar.style.display = "flex";
+            if (multiSceneBadgeTitle) multiSceneBadgeTitle.innerText = `⏱️ TRAKE (${latestParsedScenes.length} EVENTS)`;
+            renderMultiSceneTabs(latestParsedScenes);
+            const draftIndex = activeSceneTabIdx >= 0 ? activeSceneTabIdx : 0;
+            renderTrakeEventEditor(draftIndex);
+        }
+
+        // Nếu đã có kết quả TRAKE trước đó -> render lại storyboard keyframe.
         if (latestTrakeSequences && latestTrakeSequences.length > 0) {
-            renderTrakeStoryboard(latestTrakeSequences, currentViewMode);
+            renderTrakeStoryboard(latestTrakeSequences);
         }
 
         showToast("⏱️ Đã chuyển sang chế độ TRAKE (Temporal Event Extraction)!", "info", 2000);
     } else {
+        // Rời TRAKE nhưng giữ latestParsedScenes làm draft. Bỏ con trỏ editor
+        // để thao tác Visual Query ở KIS không âm thầm ghi đè một event TRAKE.
+        activeSceneTabIdx = -1;
         if (modeKisBtn) modeKisBtn.classList.add("active");
         if (modeTrakeBtn) modeTrakeBtn.classList.remove("active");
 
@@ -467,14 +534,15 @@ function switchMode(mode, saveState = true) {
         if (cardTrakeParams) {
             cardTrakeParams.style.display = "none";
         }
+        if (multiSceneEditorCards) multiSceneEditorCards.style.display = "none";
 
         if (resultsMainTitle) {
             resultsMainTitle.innerText = "MULTIMODAL RESULTS";
         }
 
-        // Render lại kết quả KIS nếu có theo view mode hiện tại
+        // Render lại kết quả KIS bằng keyframe tĩnh.
         if (currentResults && currentResults.length > 0) {
-            renderResults(currentResults, currentViewMode);
+            renderResults(currentResults);
         }
 
         showToast("🔍 Đã chuyển về chế độ KIS / QA thông thường.", "info", 1800);
@@ -515,7 +583,13 @@ function showToast(message, type = "info", duration = 3500) {
     else if (type === "warning") icon = "⚠️";
     else if (type === "loading") icon = "⏳";
 
-    toast.innerHTML = `<span style="font-size: 1.1rem; flex-shrink: 0;">${icon}</span><span>${message}</span>`;
+    const iconElement = document.createElement("span");
+    iconElement.className = "toast-icon";
+    iconElement.textContent = icon;
+    const messageElement = document.createElement("span");
+    messageElement.className = "toast-message";
+    messageElement.textContent = String(message ?? "");
+    toast.append(iconElement, messageElement);
     container.appendChild(toast);
 
     requestAnimationFrame(() => {
@@ -679,6 +753,24 @@ bindAutoCollapse(smartDedupCheck, "card-dedup");
 // ==========================================================================
 const STORAGE_KEY = "aic_2026_control_panel_state_v3";
 
+function getSelectedValues(selectEl) {
+    return selectEl ? Array.from(selectEl.selectedOptions).map(option => option.value).filter(Boolean) : [];
+}
+
+function applySelectedValues(selectEl, values) {
+    if (!selectEl) return;
+    const selected = new Set(Array.isArray(values) ? values : []);
+    Array.from(selectEl.options).forEach(option => {
+        option.selected = selected.has(option.value);
+    });
+}
+
+function getTaxonomyFilterPayload() {
+    const categories = getSelectedValues(categorySelect);
+    const subjects = categories.includes("day_hoc") ? getSelectedValues(subcategorySelect) : [];
+    return { categories, subjects };
+}
+
 function saveControlPanelState() {
     try {
         const state = {
@@ -705,6 +797,8 @@ function saveControlPanelState() {
             top_k: topKNum ? topKNum.value : "100",
             top_v: rerankTopV ? rerankTopV.value : "5",
             k_per_video: rerankKPerVideo ? rerankKPerVideo.value : "40",
+            categories: getSelectedValues(categorySelect),
+            sub_categories: getSelectedValues(subcategorySelect),
 
             // Tham số TARS DP (TRAKE Mode)
             trake_candidate_pool: trakeCandidatePoolInput ? trakeCandidatePoolInput.value : "100",
@@ -723,6 +817,7 @@ function saveControlPanelState() {
             collapsed_ocr: document.getElementById("card-ocr")?.classList.contains("is-collapsed"),
             collapsed_object: document.getElementById("card-object")?.classList.contains("is-collapsed"),
             collapsed_dedup: document.getElementById("card-dedup")?.classList.contains("is-collapsed"),
+            collapsed_category: cardCategoryFilter?.classList.contains("is-collapsed"),
             collapsed_filter: document.getElementById("card-filter")?.classList.contains("is-collapsed"),
             collapsed_trake_params: document.getElementById("card-trake-params")?.classList.contains("is-collapsed"),
             collapsed_submission: document.getElementById("card-submission")?.classList.contains("is-collapsed"),
@@ -732,6 +827,34 @@ function saveControlPanelState() {
     } catch (e) {
         console.warn("Could not save to localStorage", e);
     }
+}
+
+function restoreBoundedNumberInput(input, savedValue) {
+    if (!input) return savedValue;
+    const parsed = Number(savedValue);
+    const min = Number(input.min);
+    const max = Number(input.max);
+    const fallback = Number(input.defaultValue || input.value);
+    const inRange = Number.isFinite(parsed)
+        && (!Number.isFinite(min) || parsed >= min)
+        && (!Number.isFinite(max) || parsed <= max);
+    const restored = inRange ? parsed : fallback;
+    input.value = restored;
+    return restored;
+}
+
+function getBoundedNumberInput(input, fallback) {
+    if (!input) return fallback;
+    const parsed = Number(input.value);
+    const min = Number(input.min);
+    const max = Number(input.max);
+    const safeValue = Number.isFinite(parsed) ? parsed : fallback;
+    const bounded = Math.min(
+        Number.isFinite(max) ? max : safeValue,
+        Math.max(Number.isFinite(min) ? min : safeValue, safeValue)
+    );
+    input.value = bounded;
+    return bounded;
 }
 
 function restoreControlPanelState() {
@@ -751,13 +874,15 @@ function restoreControlPanelState() {
             return;
         }
         const state = JSON.parse(raw);
+        pendingCategorySelection = Array.isArray(state.categories) ? state.categories : [];
+        pendingSubcategorySelection = Array.isArray(state.sub_categories) ? state.sub_categories : [];
         if (state.use_rrf !== undefined && useRrfCheck) useRrfCheck.checked = state.use_rrf;
         if (state.rrf_k !== undefined && rrfKInput) rrfKInput.value = state.rrf_k;
 
         if (state.enable_visual !== undefined && enableVisualCheck) enableVisualCheck.checked = state.enable_visual;
         if (state.enable_ocr !== undefined && enableOcrCheck) enableOcrCheck.checked = state.enable_ocr;
         if (state.enable_asr !== undefined && enableAsrCheck) enableAsrCheck.checked = state.enable_asr;
-        if (state.enable_object !== undefined && enableObjectCheck) enableObjectCheck.checked = state.enable_object;
+        if (enableObjectCheck) enableObjectCheck.checked = false;
 
         if (state.asr_window_n !== undefined && asrWindowPills) {
             selectedAsrWindowN = parseInt(state.asr_window_n) || 1;
@@ -822,11 +947,18 @@ function restoreControlPanelState() {
             trakeCandidatePoolInput.value = state.trake_candidate_pool;
             if (trakeCandidatePoolSlider) trakeCandidatePoolSlider.value = state.trake_candidate_pool;
         }
-        if (state.trake_top_v !== undefined && trakeTopVInput) trakeTopVInput.value = state.trake_top_v;
-        if (state.trake_frames_per_vid !== undefined && trakeFramesPerVidInput) trakeFramesPerVidInput.value = state.trake_frames_per_vid;
+        if (state.trake_top_v !== undefined && trakeTopVInput) {
+            state.trake_top_v = restoreBoundedNumberInput(trakeTopVInput, state.trake_top_v);
+        }
+        if (state.trake_frames_per_vid !== undefined && trakeFramesPerVidInput) {
+            state.trake_frames_per_vid = restoreBoundedNumberInput(trakeFramesPerVidInput, state.trake_frames_per_vid);
+        }
         if (state.trake_lambda !== undefined && trakeLambdaInput) trakeLambdaInput.value = state.trake_lambda;
         if (state.trake_kpaths !== undefined && trakeKpathsInput) trakeKpathsInput.value = state.trake_kpaths;
         if (state.trake_top_k !== undefined && trakeTopKInput) trakeTopKInput.value = state.trake_top_k;
+
+        // Loai bo gia tri cu vuot min/max de lan F5 sau khong tai lai cau hinh nang.
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 
         if (state.sub_dir_path && subDirPathInput) {
             subDirPathInput.value = state.sub_dir_path;
@@ -844,6 +976,7 @@ function restoreControlPanelState() {
         setCardCollapsed(document.getElementById("card-ocr"), state.collapsed_ocr !== undefined ? state.collapsed_ocr : !enableOcrCheck.checked);
         setCardCollapsed(document.getElementById("card-object"), state.collapsed_object !== undefined ? state.collapsed_object : !enableObjectCheck.checked);
         setCardCollapsed(document.getElementById("card-dedup"), state.collapsed_dedup !== undefined ? state.collapsed_dedup : !smartDedupCheck.checked);
+        setCardCollapsed(cardCategoryFilter, state.collapsed_category !== undefined ? state.collapsed_category : true);
         setCardCollapsed(document.getElementById("card-filter"), state.collapsed_filter !== undefined ? state.collapsed_filter : true);
         if (cardTrakeParams && state.collapsed_trake_params !== undefined) {
             setCardCollapsed(cardTrakeParams, state.collapsed_trake_params);
@@ -985,11 +1118,10 @@ if (smartDedupCheck && uniqueVideoCheck) {
     });
 }
 
-// Load & Save Gemini API Key vào localStorage
-const DEFAULT_GEMINI_KEY = "REMOVED_REVOKED_CREDENTIAL";
+// Load & Save Gemini API Key vào localStorage. Không nhúng secret vào source.
 if (geminiApiKeyInput) {
     const savedKey = localStorage.getItem("gemini_api_key");
-    geminiApiKeyInput.value = savedKey || DEFAULT_GEMINI_KEY;
+    geminiApiKeyInput.value = savedKey || "";
 
     geminiApiKeyInput.addEventListener("input", (e) => {
         localStorage.setItem("gemini_api_key", e.target.value.trim());
@@ -1075,6 +1207,189 @@ if (qwenTopkPills && qwenTopkChainsInput) {
 // ==========================================================================
 // GEMINI PROMPT PARSER (TÔN TRỌNG TRẠNG THÁI CHECKBOX CỦA NGƯỜI DÙNG)
 // ==========================================================================
+function parseLocalTrakeEvents(rawText) {
+    const normalized = String(rawText || "").replace(/\r\n?/g, "\n").trim();
+    if (!normalized) return [];
+
+    const explicitMatches = Array.from(normalized.matchAll(/E\d+\s*:\s*([\s\S]*?)(?=(?:\n?\s*E\d+\s*:)|$)/gi));
+    let eventTexts = explicitMatches.map(match => match[1].trim()).filter(Boolean);
+    if (eventTexts.length < 2) {
+        eventTexts = normalized
+            .split(/\n[\t ]*\n+/)
+            .map(block => block.replace(/\s*\n\s*/g, " ").trim())
+            .filter(Boolean);
+    }
+    if (eventTexts.length < 2) return [];
+
+    return eventTexts.map((text, index) => ({
+        scene_idx: index + 1,
+        name: `E${index + 1}: ${text.slice(0, 36)}${text.length > 36 ? "…" : ""}`,
+        visual_query: text,
+        ocr_query: "",
+        speech_query: "",
+        object_filter: null
+    }));
+}
+
+function reindexTrakeScenes() {
+    latestParsedScenes.forEach((scene, index) => {
+        const text = String(scene.visual_query || "").trim();
+        scene.scene_idx = index + 1;
+        scene.name = `E${index + 1}: ${text.slice(0, 36)}${text.length > 36 ? "…" : ""}`;
+    });
+}
+
+function renderTrakeEventEditor(activeIndex = 0) {
+    if (!multiSceneEditorCards || currentAppMode !== "TRAKE" || latestParsedScenes.length < 2) return;
+    const safeIndex = Math.max(0, Math.min(activeIndex, latestParsedScenes.length - 1));
+    const scene = latestParsedScenes[safeIndex];
+    activeSceneTabIdx = safeIndex;
+    multiSceneTabs?.querySelectorAll(".scene-tab-btn").forEach((button, index) => {
+        button.classList.toggle("active-scene-tab", index === safeIndex + 1);
+    });
+    multiSceneEditorCards.style.display = "block";
+    multiSceneEditorCards.innerHTML = "";
+
+    const editor = document.createElement("div");
+    editor.className = "trake-event-editor";
+
+    const header = document.createElement("div");
+    header.className = "trake-event-editor-header";
+    const title = document.createElement("strong");
+    title.textContent = `E${safeIndex + 1}`;
+    const hint = document.createElement("span");
+    hint.textContent = "Alt+↑/↓ đổi vị trí";
+    header.append(title, hint);
+
+    const textarea = document.createElement("textarea");
+    textarea.rows = 2;
+    textarea.value = scene.visual_query || "";
+    textarea.setAttribute("aria-label", `Nội dung sự kiện E${safeIndex + 1}`);
+    textarea.addEventListener("input", () => {
+        scene.visual_query = textarea.value;
+        reindexTrakeScenes();
+        const tab = document.getElementById(`scene-tab-btn-${safeIndex}`);
+        if (tab) tab.title = textarea.value;
+        if (searchInput && activeSceneTabIdx === safeIndex) searchInput.value = textarea.value;
+    });
+    textarea.addEventListener("keydown", (event) => {
+        if (!event.altKey || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+        event.preventDefault();
+        const direction = event.key === "ArrowUp" ? -1 : 1;
+        const targetIndex = safeIndex + direction;
+        if (targetIndex < 0 || targetIndex >= latestParsedScenes.length) return;
+        [latestParsedScenes[safeIndex], latestParsedScenes[targetIndex]] = [latestParsedScenes[targetIndex], latestParsedScenes[safeIndex]];
+        reindexTrakeScenes();
+        renderMultiSceneTabs(latestParsedScenes);
+        renderTrakeEventEditor(targetIndex);
+    });
+
+    const actions = document.createElement("div");
+    actions.className = "trake-event-editor-actions";
+    const makeAction = (label, titleText, handler, danger = false) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = label;
+        button.title = titleText;
+        if (danger) button.classList.add("danger");
+        button.addEventListener("click", handler);
+        return button;
+    };
+    const insertAt = index => {
+        latestParsedScenes.splice(index, 0, { visual_query: "", ocr_query: "", speech_query: "", object_filter: null });
+        reindexTrakeScenes();
+        renderMultiSceneTabs(latestParsedScenes);
+        renderTrakeEventEditor(index);
+        multiSceneEditorCards.querySelector("textarea")?.focus();
+    };
+    actions.append(
+        makeAction("＋ Trước", "Chèn event trước vị trí hiện tại", () => insertAt(safeIndex)),
+        makeAction("＋ Sau", "Chèn event sau vị trí hiện tại", () => insertAt(safeIndex + 1)),
+        makeAction("Xóa", "Xóa event hiện tại", () => {
+            if (latestParsedScenes.length <= 2) {
+                showToast("TRAKE cần ít nhất 2 sự kiện.", "warning", 2200);
+                return;
+            }
+            latestParsedScenes.splice(safeIndex, 1);
+            reindexTrakeScenes();
+            const nextIndex = Math.min(safeIndex, latestParsedScenes.length - 1);
+            renderMultiSceneTabs(latestParsedScenes);
+            renderTrakeEventEditor(nextIndex);
+        }, true)
+    );
+
+    editor.append(header, textarea, actions);
+    multiSceneEditorCards.appendChild(editor);
+}
+
+function activateLocalTrakeDraft(scenes, sourceInput = null) {
+    latestParsedScenes = scenes;
+    latestUnifiedVisual = scenes.map(scene => scene.visual_query).join("; ");
+    latestRerankerQuery = sourceInput?.value.trim() || rawQueryInput?.value.trim() || latestUnifiedVisual;
+    isMultiSceneMode = true;
+    switchMode("TRAKE");
+    renderMultiSceneTabs(scenes);
+    renderTrakeEventEditor(0);
+    if (multiSceneBar) multiSceneBar.style.display = "flex";
+    if (multiSceneBadgeTitle) multiSceneBadgeTitle.innerText = `⏱️ TRAKE (${scenes.length} EVENTS)`;
+    if (multiSceneSummary) multiSceneSummary.innerText = `${scenes.length} sự kiện · Enter lần nữa để tìm`;
+    // Giữ nguyên văn bản nhiều đoạn nếu Visual Query là nơi nhập nguồn. Nếu thay
+    // bằng E1 ở đây thì chữ ký draft đổi và Enter lần hai không thể chạy TRAKE.
+    if (searchInput && sourceInput !== searchInput) searchInput.value = scenes[0].visual_query;
+    statusText.innerText = `Đã định dạng E1–E${scenes.length}. Kiểm tra/chỉnh sửa rồi nhấn Enter lần nữa để SEARCH TRAKE.`;
+    showToast(`Đã nhận diện ${scenes.length} sự kiện TRAKE. Enter lần nữa để tìm.`, "success", 3000);
+}
+
+function resetTrakeEnterState(sourceInput = null) {
+    if (!sourceInput || trakeDraftSourceId === sourceInput.id) {
+        trakeEnterStage = 0;
+        trakeDraftSignature = "";
+        trakeDraftSourceId = "";
+    }
+}
+
+function handleTrakeDraftEnter(event, sourceInput) {
+    if (event.key !== "Enter" || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey || event.isComposing) return;
+
+    const signature = sourceInput.value.replace(/\r\n?/g, "\n").trim();
+    if (
+        trakeEnterStage === 1
+        && trakeDraftSourceId === sourceInput.id
+        && signature === trakeDraftSignature
+        && latestParsedScenes.length >= 2
+    ) {
+        event.preventDefault();
+        event.stopPropagation();
+        resetTrakeEnterState();
+        performTrakeSearch();
+        return;
+    }
+
+    const scenes = parseLocalTrakeEvents(signature);
+    if (scenes.length >= 2) {
+        event.preventDefault();
+        event.stopPropagation();
+        activateLocalTrakeDraft(scenes, sourceInput);
+        trakeEnterStage = 1;
+        trakeDraftSignature = signature;
+        trakeDraftSourceId = sourceInput.id;
+        return;
+    }
+
+    // Visual Query một cảnh vẫn giữ hành vi Enter = tìm kiếm thông thường.
+    if (sourceInput === searchInput) {
+        event.preventDefault();
+        event.stopPropagation();
+        performSearch();
+    }
+}
+
+[rawQueryInput, searchInput].forEach(sourceInput => {
+    if (!sourceInput) return;
+    sourceInput.addEventListener("input", () => resetTrakeEnterState(sourceInput));
+    sourceInput.addEventListener("keydown", event => handleTrakeDraftEnter(event, sourceInput));
+});
+
 async function parseWithGemini() {
     const rawText = rawQueryInput ? rawQueryInput.value.trim() : "";
     if (!rawText) {
@@ -1128,7 +1443,7 @@ async function parseWithGemini() {
             rerankHintInput.value = data.rerank_hint || "";
         }
         if (geminiRerankGuidance) {
-            geminiRerankGuidance.style.display = (data.task_type === "TRAKE" || data.is_multi_scene || currentDiscriminatingFeatures.length > 0) ? "block" : "none";
+            geminiRerankGuidance.style.display = RERANK_FEATURE_VISIBLE && (data.task_type === "TRAKE" || data.is_multi_scene || currentDiscriminatingFeatures.length > 0) ? "block" : "none";
         }
 
         // Điền gợi ý lớp vật thể RT-DETR (KHÔNG tự động bật công tắc)
@@ -1167,6 +1482,8 @@ async function parseWithGemini() {
 
             // Tự động chuyển sang TRAKE Mode
             switchMode("TRAKE");
+            renderMultiSceneTabs(data.scenes);
+            renderTrakeEventEditor(0);
             statusText.innerText = `⏱️ [TRAKE MODE - ${data.scenes.length} SỰ KIỆN - ${parserSrc}] Đã nạp bối cảnh và chuỗi E1..E${data.scenes.length}. Bấm '⏱️ SEARCH TRAKE' để chạy TARS Monotonic DP.`;
             showToast(`⏱️ Đã phát hiện bài toán TRAKE (${data.scenes.length} sự kiện tuần tự) -> Tự động chuyển sang TRAKE Mode!`, "success", 3000);
 
@@ -1182,7 +1499,7 @@ async function parseWithGemini() {
                 multiSceneSummary.innerText = `Phát hiện ${data.scenes.length} phân cảnh nối tiếp: ${data.scenes.map(s => s.name || `Cảnh ${s.scene_idx}`).join(" ➔ ")}`;
             }
             if (multiSearchBtn) {
-                multiSearchBtn.disabled = false;
+                multiSearchBtn.disabled = !backendReady;
                 multiSearchBtn.classList.add("active-multi-ready");
             }
             statusText.innerText = `✨ [ĐA PHÂN CẢNH ${data.scenes.length} ĐOẠN - ${parserSrc}] Nút 🎬 MULTI-SCENE đã mở khóa. Bấm '🚀 SEARCH NOW' (Đơn Cảnh) hoặc '🎬 MULTI-SCENE' (Giao Thoa).`;
@@ -1241,7 +1558,7 @@ function renderMultiSceneTabs(scenes) {
     // 1. Pill "Đầy Đủ (Đơn Cảnh)"
     const allTab = document.createElement("button");
     allTab.className = "scene-tab-btn active-scene-tab";
-    allTab.innerText = "🎬 Đầy Đủ (Đơn Cảnh)";
+    allTab.innerText = currentAppMode === "TRAKE" ? "Chuỗi" : "🎬 Đầy Đủ (Đơn Cảnh)";
     allTab.title = "Truy vấn toàn bộ đề bài thành 1 cảnh đơn";
     allTab.addEventListener("click", () => {
         switchSceneTab(-1);
@@ -1254,7 +1571,7 @@ function renderMultiSceneTabs(scenes) {
         tabBtn.className = "scene-tab-btn";
         tabBtn.id = `scene-tab-btn-${idx}`;
         const titleText = sc.name || `Cảnh ${idx + 1}`;
-        tabBtn.innerText = `${idx + 1}️⃣ ${titleText}`;
+        tabBtn.innerText = currentAppMode === "TRAKE" ? `E${idx + 1}` : `${idx + 1}️⃣ ${titleText}`;
         tabBtn.title = sc.visual_query || "";
         tabBtn.addEventListener("click", () => {
             switchSceneTab(idx);
@@ -1421,6 +1738,10 @@ function switchSceneTab(tabIdx) {
         if (statusText) statusText.innerText = "🎬 Đang ở chế độ Đầy Đủ (Giao Thoa Storyboard). Bấm '🚀 SEARCH NOW' để tìm đơn cảnh, hoặc '🎬 MULTI-SCENE' để quét giao thoa.";
     }
 
+    if (currentAppMode === "TRAKE" && tabIdx >= 0) {
+        renderTrakeEventEditor(tabIdx);
+    }
+
     // Nếu đã có kết quả tìm kiếm trước đó thì chuyển đổi chế độ xem kết quả
     if (!multiSceneResultsData) return;
 
@@ -1471,7 +1792,7 @@ async function performMultiSceneSearch() {
     const isVis = enableVisualCheck ? enableVisualCheck.checked : true;
     const isOcr = enableOcrCheck ? enableOcrCheck.checked : true;
     const isAsr = enableAsrCheck ? enableAsrCheck.checked : true;
-    const isObj = enableObjectCheck ? enableObjectCheck.checked : false;
+    const isObj = false;
 
     let dedupMode = "none";
     if (uniqueVideoCheck && uniqueVideoCheck.checked) {
@@ -1496,6 +1817,7 @@ async function performMultiSceneSearch() {
 
     const isRrf = useRrfCheck ? useRrfCheck.checked : true;
     const rrfK = rrfKInput ? (parseInt(rrfKInput.value) || 60) : 60;
+    const taxonomy = getTaxonomyFilterPayload();
 
     searchBtn.disabled = true;
     rerankBtn.disabled = true;
@@ -1537,8 +1859,12 @@ async function performMultiSceneSearch() {
                 rrf_use_visual: rrfSignalVisual ? rrfSignalVisual.checked : true,
                 rrf_use_asr: rrfSignalAsr ? rrfSignalAsr.checked : true,
                 rrf_use_shot: rrfSignalShot ? rrfSignalShot.checked : true,
+                rrf_use_caption: rrfSignalCaption ? rrfSignalCaption.checked : false,
+                category: taxonomy.categories,
+                sub_category: taxonomy.subjects,
+                include_videos: currentIncludeTags.length > 0 ? currentIncludeTags : null,
                 exclude_videos: currentExcludeTags.length > 0 ? currentExcludeTags : null,
-                return_shots: true
+                return_shots: false
             })
         });
 
@@ -1564,10 +1890,10 @@ async function performMultiSceneSearch() {
         showToast(`Lỗi Multi-Scene: ${err.message}`, "error");
         console.error(err);
     } finally {
-        searchBtn.disabled = false;
-        rerankBtn.disabled = false;
+        searchBtn.disabled = !backendReady;
+        rerankBtn.disabled = !backendReady;
         if (multiSearchBtn) {
-            multiSearchBtn.disabled = false;
+            multiSearchBtn.disabled = !backendReady || !isMultiSceneMode;
             multiSearchBtn.innerText = "🎬 MULTI-SCENE";
         }
         updateK2Calculation();
@@ -1577,14 +1903,14 @@ async function performMultiSceneSearch() {
 // ==========================================================================
 // RENDER TRAKE STORYBOARD MATRIX (TARS MONOTONIC DP RESULTS)
 // ==========================================================================
-function renderTrakeStoryboard(storyboardSequences, viewMode = currentViewMode) {
+function renderTrakeStoryboard(storyboardSequences) {
     if (!resultsGrid) return;
     resultsGrid.classList.add("trake-mode-grid");
     resultsGrid.innerHTML = "";
 
     // Hiển thị thanh công cụ Qwen AI Reranker khi ở chế độ TRAKE
     if (trakeQwenToolbar) {
-        trakeQwenToolbar.style.display = (currentAppMode === "TRAKE" && storyboardSequences && storyboardSequences.length > 0) ? "flex" : "none";
+        trakeQwenToolbar.style.display = RERANK_FEATURE_VISIBLE && (currentAppMode === "TRAKE" && storyboardSequences && storyboardSequences.length > 0) ? "flex" : "none";
     }
 
     if (!storyboardSequences || storyboardSequences.length === 0) {
@@ -1593,8 +1919,6 @@ function renderTrakeStoryboard(storyboardSequences, viewMode = currentViewMode) 
         </div>`;
         return;
     }
-
-    const isShotMode = (viewMode === "shot");
 
     const wrapper = document.createElement("div");
     wrapper.className = "trake-results-wrapper";
@@ -1643,28 +1967,20 @@ function renderTrakeStoryboard(storyboardSequences, viewMode = currentViewMode) 
             }
 
             const eventLabel = sc.scene_name ? (sc.scene_name.includes(":") ? sc.scene_name.split(":")[0] : `E${scIdx + 1}`) : `E${scIdx + 1}`;
-            const hasCutVideo = isShotMode && !!sc.video_url;
-            const shotBadge = (isShotMode && sc.shot_id)
-                ? `<span class="sb-shot-badge" style="background: rgba(14, 165, 233, 0.2); border: 1px solid rgba(14, 165, 233, 0.4); color: #38bdf8; padding: 1px 5px; border-radius: 3px; font-size: 0.65rem; font-family: var(--font-mono); font-weight: 600;">🎬 #${sc.shot_index || 1} (${sc.shot_duration_sec || 0}s)</span>`
-                : "";
-
             scenesHtml += `
                 <div class="storyboard-scene-card" data-vid="${sc.video_id}" data-fid="${sc.frame_id}">
                     <span class="trake-event-tag">${eventLabel}</span>
-                    <div class="storyboard-thumb-wrapper" title="${isShotMode ? '🔍 Click phóng to / Rê chuột xem video shot' : '🔍 Bấm để xem chi tiết / Bounding Box'}" style="position: relative; overflow: hidden; cursor: pointer; height: 130px; background: #000;">
+                    <div class="storyboard-thumb-wrapper" title="🔍 Bấm để xem chi tiết / Bounding Box" style="position: relative; overflow: hidden; cursor: pointer; height: 130px; background: #000;">
                         <img src="${sc.image_url}" loading="lazy" alt="Frame ${sc.frame_id}" class="sb-thumb-img" style="width: 100%; height: 100%; object-fit: cover; display: block;">
-                        ${hasCutVideo ? `<video src="${sc.video_url}" loop muted playsinline preload="none" class="sb-video-player" style="display: none; width: 100%; height: 100%; object-fit: cover;"></video>` : ""}
                         <span class="card-score-pill">${scoreVal}</span>
-                        ${hasCutVideo ? `<span class="sb-hover-hint" style="position: absolute; bottom: 4px; right: 4px; background: rgba(0,0,0,0.75); font-size: 0.60rem; color: #38bdf8; padding: 1px 5px; border-radius: 3px; pointer-events: none;">▶ Shot</span>` : ""}
                     </div>
                     <div class="storyboard-meta-bar">
                         <div class="storyboard-info-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
                             <span style="font-weight: 700; color: #38bdf8; font-size: 0.72rem;">⏱️ ${timeStr}</span>
                             <span style="color: var(--text-dim); font-weight: 700; font-size: 0.70rem;">F:${sc.frame_id}</span>
                         </div>
-                        ${shotBadge ? `<div style="margin-bottom: 4px; display: flex; align-items: center; gap: 4px;">${shotBadge}</div>` : ""}
                         <div class="storyboard-actions-row">
-                            <button class="btn-card-action btn-sb-video" title="${isShotMode ? 'Phát video shot phân cảnh' : 'Xem video tại giây này'}">${isShotMode && hasCutVideo ? '🎬 Phát' : '▶️ Video'}</button>
+                            <button class="btn-card-action btn-sb-video" title="Xem video đầy đủ tại giây này">▶️ Video</button>
                             <button class="btn-card-action btn-sb-copy" title="Copy Frame ID">📋 Copy</button>
                         </div>
                     </div>
@@ -1683,6 +1999,7 @@ function renderTrakeStoryboard(storyboardSequences, viewMode = currentViewMode) 
                     ${qwenBadgeHtml}
                 </div>
                 <div class="storyboard-header-actions" style="display: flex; align-items: center; gap: 8px;">
+                    <button class="btn-card-action btn-dres-submit-trake" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; font-weight: 700; padding: 6px 12px; border-radius: 6px; box-shadow: 0 2px 8px rgba(16,185,129,0.35); border: none; cursor: pointer;" data-vid="${seq.video_id}" title="Nộp toàn bộ chuỗi sự kiện này lên DRES">🚀 NỘP DRES CHUỖI NÀY</button>
                     <code class="trake-sub-code">${seq.submission_line}</code>
                     <button class="btn-card-action btn-copy-trake-line" data-line="${seq.submission_line}">📋 Copy Line</button>
                     <button class="btn-card-action btn-sb-timeline-all" data-vid="${seq.video_id}">🎞️ Timeline</button>
@@ -1700,27 +2017,6 @@ function renderTrakeStoryboard(storyboardSequences, viewMode = currentViewMode) 
         groupCard.querySelectorAll(".storyboard-scene-card").forEach((scCard, idx) => {
             const scData = seq.scenes[idx];
             const imgBox = scCard.querySelector(".storyboard-thumb-wrapper");
-            const thumbImg = scCard.querySelector(".sb-thumb-img");
-            const videoEl = scCard.querySelector(".sb-video-player");
-            const hoverHint = scCard.querySelector(".sb-hover-hint");
-
-            // Hover phát video phân cảnh con chỉ khi ở chế độ Shot
-            if (isShotMode && imgBox && videoEl) {
-                imgBox.addEventListener("mouseenter", () => {
-                    if (thumbImg) thumbImg.style.display = "none";
-                    videoEl.style.display = "block";
-                    if (hoverHint) hoverHint.style.display = "none";
-                    videoEl.play().catch(e => console.warn("Hover play shot:", e));
-                });
-                imgBox.addEventListener("mouseleave", () => {
-                    videoEl.pause();
-                    videoEl.currentTime = 0;
-                    videoEl.style.display = "none";
-                    if (thumbImg) thumbImg.style.display = "block";
-                    if (hoverHint) hoverHint.style.display = "block";
-                });
-            }
-
             if (imgBox) {
                 imgBox.addEventListener("click", () => {
                     openLightbox(0, [scData]);
@@ -1730,17 +2026,7 @@ function renderTrakeStoryboard(storyboardSequences, viewMode = currentViewMode) 
             const vidBtn = scCard.querySelector(".btn-sb-video");
             if (vidBtn) {
                 vidBtn.addEventListener("click", () => {
-                    if (isShotMode && videoEl) {
-                        if (videoEl.paused) {
-                            if (thumbImg) thumbImg.style.display = "none";
-                            videoEl.style.display = "block";
-                            videoEl.play();
-                        } else {
-                            videoEl.pause();
-                        }
-                    } else {
-                        openVideoPlayer(scData.video_id, scData.frame_id, scData.timestamp_sec);
-                    }
+                    openVideoPlayer(scData.video_id, scData.frame_id, scData.timestamp_sec);
                 });
             }
 
@@ -1758,6 +2044,14 @@ function renderTrakeStoryboard(storyboardSequences, viewMode = currentViewMode) 
         });
 
         // Nút Copy toàn bộ dòng TRAKE Line
+        const btnDresTrake = groupCard.querySelector(".btn-dres-submit-trake");
+        if (btnDresTrake) {
+            btnDresTrake.addEventListener("click", () => {
+                const frameIds = seq.scenes.map(s => s.frame_id);
+                triggerDresTrakeSubmit(seq.video_id, frameIds, btnDresTrake);
+            });
+        }
+
         const copyLineBtn = groupCard.querySelector(".btn-copy-trake-line");
         if (copyLineBtn) {
             copyLineBtn.addEventListener("click", () => {
@@ -1851,7 +2145,7 @@ async function performQwenRerankChains() {
 
         if (data.storyboard_sequences && data.storyboard_sequences.length > 0) {
             latestTrakeSequences = data.storyboard_sequences;
-            renderTrakeStoryboard(latestTrakeSequences, currentViewMode);
+            renderTrakeStoryboard(latestTrakeSequences);
             if (qwenProgressText) qwenProgressText.innerText = `✅ Đã chấm ${data.total_evaluated} chuỗi (${elapsed}s)`;
             statusText.innerText = `🤖 QWEN RERANK HOÀN TẤT: Đã tái xếp hạng ${data.total_evaluated} chuỗi TRAKE trong ${elapsed}s!`;
             showToast(`✅ Qwen-VL đã tái xếp hạng thành công ${data.total_evaluated} chuỗi (${elapsed}s)!`, "success");
@@ -1889,7 +2183,7 @@ async function performTrakeSearch() {
     const isVis = enableVisualCheck ? enableVisualCheck.checked : true;
     const isOcr = enableOcrCheck ? enableOcrCheck.checked : true;
     const isAsr = enableAsrCheck ? enableAsrCheck.checked : true;
-    const isObj = enableObjectCheck ? enableObjectCheck.checked : false;
+    const isObj = false;
 
     let dedupMode = "none";
     if (uniqueVideoCheck && uniqueVideoCheck.checked) {
@@ -1901,10 +2195,13 @@ async function performTrakeSearch() {
 
     const lambdaVal = parseFloat(trakeLambdaInput ? trakeLambdaInput.value : 0.001) || 0.001;
     const kPathsVal = parseInt(trakeKpathsInput ? trakeKpathsInput.value : 3) || 3;
-    const topKSeqVal = parseInt(trakeTopKInput ? trakeTopKInput.value : 10) || 10;
+    const requestedTopKSeqVal = parseInt(trakeTopKInput ? trakeTopKInput.value : 10) || 10;
     const topK1Val = parseInt(trakeCandidatePoolInput ? trakeCandidatePoolInput.value : (topKNum ? topKNum.value : 100)) || 100;
-    const topVVal = parseInt(trakeTopVInput ? trakeTopVInput.value : 10) || 10;
-    const mFramesVal = parseInt(trakeFramesPerVidInput ? trakeFramesPerVidInput.value : 40) || 40;
+    const topVVal = Math.trunc(getBoundedNumberInput(trakeTopVInput, 10));
+    const mFramesVal = Math.trunc(getBoundedNumberInput(trakeFramesPerVidInput, 40));
+    const refineCallCount = scenesToSearch.length * topVVal;
+    const maxSequenceCapacity = topVVal * kPathsVal;
+    const topKSeqVal = Math.min(requestedTopKSeqVal, maxSequenceCapacity);
 
     const objClass = isObj ? parseInt(objectClassSelect ? objectClassSelect.value : 0) : null;
     const objConf = isObj ? parseFloat(objectConfSlider ? objectConfSlider.value : 0.3) : 0.0;
@@ -1917,10 +2214,25 @@ async function performTrakeSearch() {
 
     const isRrf = useRrfCheck ? useRrfCheck.checked : true;
     const rrfK = rrfKInput ? (parseInt(rrfKInput.value) || 60) : 60;
+    const taxonomy = getTaxonomyFilterPayload();
 
     if (trakeSearchBtn) {
         trakeSearchBtn.disabled = true;
         trakeSearchBtn.innerText = "⏳ ĐANG CHẠY TARS DP...";
+    }
+    if (requestedTopKSeqVal > maxSequenceCapacity) {
+        showToast(
+            `Top Sequences được giới hạn ${requestedTopKSeqVal} → ${topKSeqVal} (Top V ${topVVal} × K-paths ${kPathsVal}).`,
+            "warning",
+            4200
+        );
+    }
+    if (refineCallCount > 100) {
+        showToast(
+            `⚠️ Cấu hình nặng: ${scenesToSearch.length} events × ${topVVal} videos = ${refineCallCount} lượt refine.`,
+            "warning",
+            5200
+        );
     }
     statusText.innerText = `⏱️ Đang thực thi TARS Monotonic DP (Pool K1=${topK1Val}, Top V=${topVVal}, λ=${lambdaVal}, K-paths=${kPathsVal})...`;
     showToast(`⏱️ Đang chạy TARS Monotonic DP (Pool K1=${topK1Val}, Top V=${topVVal})...`, "loading", 0);
@@ -1961,8 +2273,13 @@ async function performTrakeSearch() {
                 rrf_use_visual: rrfSignalVisual ? rrfSignalVisual.checked : true,
                 rrf_use_asr: rrfSignalAsr ? rrfSignalAsr.checked : true,
                 rrf_use_shot: rrfSignalShot ? rrfSignalShot.checked : true,
+                rrf_use_caption: rrfSignalCaption ? rrfSignalCaption.checked : false,
+                category: taxonomy.categories,
+                sub_category: taxonomy.subjects,
+                include_videos: currentIncludeTags.length > 0 ? currentIncludeTags : null,
                 exclude_videos: currentExcludeTags.length > 0 ? currentExcludeTags : null,
-                return_shots: true
+                return_shots: false,
+                compact_response: true
             })
         });
 
@@ -1981,7 +2298,7 @@ async function performTrakeSearch() {
         statusText.innerText = `⏱️ TRAKE: TARS DP hoàn tất trong ${elapsedSec}s! Tìm thấy ${latestTrakeSequences.length} chuỗi tuần tự từ Top ${data.top_videos ? data.top_videos.length : 0} Video.`;
         showToast(`✅ Đã tìm thấy ${latestTrakeSequences.length} chuỗi TRAKE tối ưu (${elapsedSec}s)!`, "success");
 
-        renderTrakeStoryboard(latestTrakeSequences, currentViewMode);
+        renderTrakeStoryboard(latestTrakeSequences);
 
     } catch (err) {
         dismissLoadingToast();
@@ -1990,7 +2307,7 @@ async function performTrakeSearch() {
         console.error(err);
     } finally {
         if (trakeSearchBtn) {
-            trakeSearchBtn.disabled = false;
+            trakeSearchBtn.disabled = !backendReady;
             trakeSearchBtn.innerText = "⏱️ SEARCH TRAKE";
         }
     }
@@ -2028,7 +2345,7 @@ async function performSearch() {
     const isVis = enableVisualCheck ? enableVisualCheck.checked : true;
     const isOcr = enableOcrCheck ? enableOcrCheck.checked : true;
     const isAsr = enableAsrCheck ? enableAsrCheck.checked : true;
-    const isObj = enableObjectCheck ? enableObjectCheck.checked : false;
+    const isObj = false;
 
     const qVisual = isVis && searchInput ? searchInput.value.trim() : "";
     const qOcr = isOcr && ocrInput ? ocrInput.value.trim() : "";
@@ -2081,8 +2398,7 @@ async function performSearch() {
 
     commitPendingTags();
 
-    const selCat = categorySelect ? categorySelect.value : "";
-    const selSubCat = (groupSubcategory && groupSubcategory.style.display !== "none" && subcategorySelect) ? subcategorySelect.value : "";
+    const taxonomy = getTaxonomyFilterPayload();
 
     const payload = {
         query: qVisual,
@@ -2102,8 +2418,8 @@ async function performSearch() {
         video_id: "",
         include_videos: currentIncludeTags.length > 0 ? currentIncludeTags : null,
         exclude_videos: currentExcludeTags.length > 0 ? currentExcludeTags : null,
-        category: (selCat && selCat !== "all") ? selCat : "",
-        sub_category: (selSubCat && selSubCat !== "all") ? selSubCat : "",
+        category: taxonomy.categories,
+        sub_category: taxonomy.subjects,
         weight_visual: isVis ? parseFloat(weightVisualSlider ? weightVisualSlider.value : 1.0) : 0.0,
         weight_ocr: isOcr ? parseFloat(weightOcrSlider ? weightOcrSlider.value : 1.0) : 0.0,
         weight_asr: isAsr ? parseFloat(weightAsrSlider ? weightAsrSlider.value : 1.0) : 0.0,
@@ -2115,7 +2431,8 @@ async function performSearch() {
         rrf_use_visual: rrfSignalVisual ? rrfSignalVisual.checked : true,
         rrf_use_asr: rrfSignalAsr ? rrfSignalAsr.checked : true,
         rrf_use_shot: rrfSignalShot ? rrfSignalShot.checked : true,
-        return_shots: true
+        rrf_use_caption: rrfSignalCaption ? rrfSignalCaption.checked : false,
+        return_shots: false
     };
 
     const t0 = performance.now();
@@ -2134,14 +2451,13 @@ async function performSearch() {
         const data = await response.json();
         dismissLoadingToast();
         currentResults = data.results || [];
-        currentShotResults = data.shot_results || [];
         currentResults.forEach((r, i) => {
             r.original_rank = i + 1;
         });
         const elapsedMs = ((performance.now() - t0) / 1000).toFixed(2);
         activeResultsSource = currentResults;
-        resultCount.innerText = `${currentResults.length} kết quả Top-K (${currentViewMode === 'shot' ? '🎬 Video Shot' : '🖼️ Keyframe'} View)`;
-        renderResults(currentResults, currentViewMode);
+        resultCount.innerText = `${currentResults.length} kết quả Top-K (🖼️ Keyframe)`;
+        renderResults(currentResults);
 
         statusText.innerText = `✅ Xong: ${currentResults.length} Top-K (${elapsedMs}s)`;
         showToast(`✅ Đã tìm thấy ${currentResults.length} kết quả Top-K (${elapsedMs}s)!`, "success");
@@ -2152,7 +2468,7 @@ async function performSearch() {
         showToast(`Lỗi tìm kiếm: ${err.message}`, "error");
         console.error(err);
     } finally {
-        searchBtn.disabled = false;
+        searchBtn.disabled = !backendReady;
         searchBtn.innerText = "🚀 SEARCH NOW";
     }
 }
@@ -2185,7 +2501,7 @@ async function performTwoStageRerank() {
     const isVis = enableVisualCheck ? enableVisualCheck.checked : true;
     const isOcr = enableOcrCheck ? enableOcrCheck.checked : true;
     const isAsr = enableAsrCheck ? enableAsrCheck.checked : true;
-    const isObj = enableObjectCheck ? enableObjectCheck.checked : false;
+    const isObj = false;
 
     const qVisual = isVis && searchInput ? searchInput.value.trim() : "";
     const qOcr = isOcr && ocrInput ? ocrInput.value.trim() : "";
@@ -2221,8 +2537,7 @@ async function performTwoStageRerank() {
 
     commitPendingTags();
 
-    const selCat = categorySelect ? categorySelect.value : "";
-    const selSubCat = (groupSubcategory && groupSubcategory.style.display !== "none" && subcategorySelect) ? subcategorySelect.value : "";
+    const taxonomy = getTaxonomyFilterPayload();
 
     const isRrf = useRrfCheck ? useRrfCheck.checked : true;
     const rrfK = rrfKInput ? (parseInt(rrfKInput.value) || 60) : 60;
@@ -2261,8 +2576,8 @@ async function performTwoStageRerank() {
                 video_id: "",
                 include_videos: currentIncludeTags.length > 0 ? currentIncludeTags : null,
                 exclude_videos: currentExcludeTags.length > 0 ? currentExcludeTags : null,
-                category: (selCat && selCat !== "all") ? selCat : "",
-                sub_category: (selSubCat && selSubCat !== "all") ? selSubCat : "",
+                category: taxonomy.categories,
+                sub_category: taxonomy.subjects,
                 top_k: topK1Val,
                 use_rrf: isRrf,
                 rrf_k: rrfK
@@ -2318,13 +2633,9 @@ if (rerankBtn) {
 }
 
 // ==========================================================================
-// RENDER KẾT QUẢ TÌM KIẾM THỐNG NHẤT (UNIFIED TOP-K PRESENTATION)
-// Áp dụng chung một thuật toán xếp hạng RRF, hỗ trợ 2 góc nhìn:
-// 1. "shot" (Mặc định): Chiếu Video Shot (.mp4 clip tự lặp, hover phát, click Lightbox)
-// 2. "kf": Chiếu Keyframe đại diện tĩnh
-// Thứ tự Top-K (#1, #2, #3...) được bảo toàn 100% khi chuyển đổi góc nhìn!
+// RENDER KẾT QUẢ TOP-K BẰNG KEYFRAME TĨNH
 // ==========================================================================
-function renderResults(results, displayMode = currentViewMode) {
+function renderResults(results) {
     if (!resultsGrid) return;
     resultsGrid.classList.remove("trake-mode-grid");
     resultsGrid.innerHTML = "";
@@ -2334,13 +2645,10 @@ function renderResults(results, displayMode = currentViewMode) {
         return;
     }
 
-    const isShotMode = (displayMode === "shot");
-
     results.forEach((res, idx) => {
         const card = document.createElement("div");
         const isExcluded = currentExcludeTags.includes((res.video_id || "").toUpperCase());
         card.className = isExcluded ? "result-card card-excluded" : "result-card";
-        if (isShotMode) card.classList.add("shot-card");
         card.dataset.videoId = res.video_id || "";
         if (res.shot_id) card.dataset.shotId = res.shot_id;
 
@@ -2354,6 +2662,10 @@ function renderResults(results, displayMode = currentViewMode) {
         // Xử lý frame_id
         let bestFid = res.best_kf_frame_id || res.anchor_frame_id || res.frame_id || "";
         if (typeof bestFid === "number") bestFid = String(bestFid).padStart(6, "0");
+        card.dataset.frameId = bestFid;
+        if (typeof dresState !== "undefined" && dresState.submittedKeys && dresState.submittedKeys.has(res.video_id + '_' + bestFid)) {
+            card.classList.add("card-dres-submitted");
+        }
 
         // Xử lý mốc thời gian
         let timeStr = "";
@@ -2390,32 +2702,17 @@ function renderResults(results, displayMode = currentViewMode) {
         const rerankBadge = res.is_reranked ? `<span class="badge-reranked">🎯 Reranked</span>` : "";
         const sceneBadge = res.scene_name ? `<span class="scene-badge-tag">🎬 ${res.scene_name}</span>` : "";
 
-        // Xác định Video URL nếu có
-        const videoUrl = res.video_url || (res.cut_file ? `http://localhost:8000/cut_videos/${res.cut_file}` : "");
-        const hasVideo = Boolean(videoUrl);
         const imgUrl = res.image_url || res.thumbnail_url || `http://localhost:8000/images/${res.video_id}/${bestFid}.jpg`;
 
-        // Phần trình chiếu Media (Media Thumb Box)
-        let mediaHtml = "";
-        if (isShotMode) {
-            mediaHtml = `
-                <div class="card-thumb-wrapper shot-media-wrapper" style="position: relative; overflow: hidden; cursor: pointer; height: 160px; background: #000;" title="Bấm để phóng to xem Video Shot">
-                    <img src="${imgUrl}" loading="lazy" alt="Shot ${res.shot_id || bestFid}" class="shot-thumb-img" style="width: 100%; height: 100%; object-fit: cover; display: block;">
-                    ${hasVideo ? `<video src="${videoUrl}" loop muted playsinline preload="none" class="shot-video-player" style="display: none; width: 100%; height: 100%; object-fit: cover;"></video>` : ''}
-                    <span class="card-score-pill">Score: ${scoreFinal}</span>
-                    <span class="card-time-pill" style="background: rgba(14, 165, 233, 0.9); font-weight: 700;">🎬 SHOT #${res.shot_index ? res.shot_index : rankNum}</span>
-                    <div class="shot-hover-badge" style="position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,0.75); padding: 3px 8px; border-radius: 4px; font-size: 0.65rem; color: #38bdf8; pointer-events: none;">${hasVideo ? '🔍 Bấm phóng to • Hover xem trước' : '🔍 Bấm phóng to'}</div>
-                </div>
-            `;
-        } else {
-            mediaHtml = `
-                <div class="card-thumb-wrapper" style="position: relative; overflow: hidden; cursor: pointer; height: 160px; background: #000;" title="🔍 Bấm vào ảnh để phóng to và soi Bounding Box">
-                    <img src="${imgUrl}" loading="lazy" alt="Keyframe ${bestFid}" style="width: 100%; height: 100%; object-fit: cover; display: block;">
-                    <span class="card-score-pill">Score: ${scoreFinal}</span>
-                    ${timeStr ? `<span class="card-time-pill">⏱️ ${timeStr}</span>` : (timeRangeStr ? `<span class="card-time-pill">⏱️ ${timeRangeStr}</span>` : '')}
-                </div>
-            `;
-        }
+        const mediaHtml = `
+            <div class="card-thumb-wrapper" style="position: relative; overflow: hidden; cursor: pointer; height: 160px; background: #000;" title="💡 Ctrl + Click: Nộp bài ngay | Click: Phóng to soi chi tiết">
+                <img src="${imgUrl}" loading="lazy" alt="Keyframe ${bestFid}" style="width: 100%; height: 100%; object-fit: cover; display: block;">
+                <span class="card-score-pill">Score: ${scoreFinal}</span>
+                ${timeStr ? `<span class="card-time-pill">⏱️ ${timeStr}</span>` : (timeRangeStr ? `<span class="card-time-pill">⏱️ ${timeRangeStr}</span>` : '')}
+                <span class="card-ctrl-hint" title="Giữ phím Ctrl + Click vào ảnh để Nộp bài ngay">⚡ Ctrl+Click: Nộp</span>
+                ${dresState.submittedKeys.has(res.video_id + '_' + bestFid) ? `<span class="card-submitted-badge">✓ ĐÃ NỘP DRES</span>` : ''}
+            </div>
+        `;
 
         // Minh bạch thứ hạng từng kênh thành phần (Transparency Ranks Breakdown)
         const rankVisDisplay = res.rank_vis !== undefined && res.rank_vis !== null ? `#${res.rank_vis}` : '-';
@@ -2444,72 +2741,56 @@ function renderResults(results, displayMode = currentViewMode) {
                 ${timeRangeStr ? `<div style="font-size: 0.72rem; color: #94a3b8; margin-bottom: 4px; font-family: 'JetBrains Mono', monospace;">⏱️ ${timeRangeStr}</div>` : ''}
                 ${speechHtml}
 
-                <div class="card-actions-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 6px;">
-                    <button class="btn-card-action btn-card-zoom" style="background: #0ea5e9; color: white; padding: 6px 2px; font-size: 0.72rem; font-weight: 600;" title="Phóng to xem chi tiết trong Lightbox">🔍 Soi ${isShotMode ? 'Shot' : 'Chi tiết'}</button>
-                    <button class="btn-card-action btn-card-fill-sub" style="background: #0284c7; color: white; padding: 6px 2px; font-size: 0.72rem; font-weight: 600;" title="Điền Video ID và Best Keyframe vào khung Nộp bài">🎯 Nộp KIS</button>
+                <div class="card-actions-row" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; margin-top: 6px;">
+                    <button class="btn-card-action btn-card-zoom" style="background: #0ea5e9; color: white; padding: 6px 2px; font-size: 0.72rem; font-weight: 600;" title="Phóng to xem chi tiết trong Lightbox">🔍 Soi</button>
                     <button class="btn-card-action btn-card-timeline" style="background: #334155; color: white; padding: 6px 2px; font-size: 0.72rem; font-weight: 600;" title="Xem toàn bộ Timeline video">🎞️ Timeline</button>
                     <button class="btn-card-action btn-card-copy" style="background: #1e293b; color: #cbd5e1; padding: 6px 2px; font-size: 0.72rem; font-weight: 600;" title="Copy Video ID & Frame ID">📋 Copy ID</button>
-                    <button class="btn-card-exclude ${isExcluded ? 'is-excluded' : ''}" style="grid-column: 1 / -1; margin-top: 2px;" title="Loại trừ / hoàn tác loại trừ video này khỏi kết quả">
-                        ${isExcluded ? '🔴 Đã loại • Bỏ loại trừ' : '🚫 Loại video này'}
-                    </button>
                 </div>
+                <button class="btn-card-exclude ${isExcluded ? 'is-excluded' : ''}" style="width: 100%; margin-top: 3px;" title="Loại trừ / hoàn tác loại trừ video này khỏi kết quả">
+                    ${isExcluded ? '🔴 Đã loại • Bỏ loại trừ' : '🚫 Loại video này'}
+                </button>
             </div>
         `;
 
-        // Gắn sự kiện phóng to Media Box
+        // Gắn sự kiện click / Ctrl+Click
+        const handleCtrlSubmit = (e) => {
+            if (e.ctrlKey || e.metaKey) {
+                e.stopPropagation();
+                e.preventDefault();
+                handleDresFastSubmit(res.video_id, bestFid, card);
+                return true;
+            }
+            return false;
+        };
+
         const mediaBox = card.querySelector(".card-thumb-wrapper");
-        const thumbImg = card.querySelector(".shot-thumb-img");
-        const videoEl = card.querySelector(".shot-video-player");
-        const hoverBadge = card.querySelector(".shot-hover-badge");
         const vidRow = card.querySelector(".card-video-row");
 
         if (mediaBox) {
-            if (isShotMode && videoEl) {
-                mediaBox.addEventListener("mouseenter", () => {
-                    if (thumbImg) thumbImg.style.display = "none";
-                    videoEl.style.display = "block";
-                    if (hoverBadge) hoverBadge.style.display = "none";
-                    videoEl.play().catch(e => console.warn("Hover play:", e));
-                });
-                mediaBox.addEventListener("mouseleave", () => {
-                    videoEl.pause();
-                    videoEl.currentTime = 0;
-                    videoEl.style.display = "none";
-                    if (thumbImg) thumbImg.style.display = "block";
-                    if (hoverBadge) hoverBadge.style.display = "block";
-                });
-            }
             mediaBox.addEventListener("click", (e) => {
-                e.stopPropagation();
-                if (videoEl) videoEl.pause();
+                if (handleCtrlSubmit(e)) return;
                 openLightbox(idx, results);
             });
         }
 
         if (vidRow) {
             vidRow.addEventListener("click", (e) => {
-                e.stopPropagation();
-                if (videoEl) videoEl.pause();
+                if (handleCtrlSubmit(e)) return;
                 openLightbox(idx, results);
             });
         }
+
+        card.addEventListener("click", (e) => {
+            if (e.ctrlKey || e.metaKey) {
+                handleCtrlSubmit(e);
+            }
+        });
 
         const btnZoom = card.querySelector(".btn-card-zoom");
         if (btnZoom) {
             btnZoom.addEventListener("click", (e) => {
                 e.stopPropagation();
-                if (videoEl) videoEl.pause();
                 openLightbox(idx, results);
-            });
-        }
-
-        const btnFillSub = card.querySelector(".btn-card-fill-sub");
-        if (btnFillSub) {
-            btnFillSub.addEventListener("click", (e) => {
-                e.stopPropagation();
-                if (subVideoIdInput) subVideoIdInput.value = res.video_id;
-                if (subFrameAInput) subFrameAInput.value = bestFid;
-                showToast(`🎯 Đã chọn: Video ${res.video_id} Frame ${bestFid}`, "success");
             });
         }
 
@@ -2556,11 +2837,6 @@ function renderResults(results, displayMode = currentViewMode) {
 
         resultsGrid.appendChild(card);
     });
-}
-
-// Giữ hàm renderShotResults để tương thích ngược, gọi renderResults ở chế độ "shot"
-function renderShotResults(shots) {
-    renderResults(shots, "shot");
 }
 
 // ==========================================================================
@@ -2615,66 +2891,18 @@ function applyExcludeStateToGrid() {
 }
 window.applyExcludeStateToGrid = applyExcludeStateToGrid;
 
-function setLightboxMediaMode(mode, item = null, bestFid = null) {
-    if (!item && activeResultsSource && activeResultsSource[currentLightboxIndex]) {
-        item = activeResultsSource[currentLightboxIndex];
-    }
+function showLightboxKeyframe(item, bestFid) {
     if (!item) return;
+    if (lightboxZoomBox) lightboxZoomBox.style.display = "block";
+    if (lightboxCanvasControls) lightboxCanvasControls.style.display = "flex";
 
-    if (!bestFid) {
-        bestFid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id || "";
-        if (typeof bestFid === "number") bestFid = String(bestFid).padStart(6, "0");
-    }
-
-    currentLightboxMediaMode = mode;
-
-    if (mode === "shot" && (item.video_url || item.cut_file)) {
-        if (btnLightboxModeShot) {
-            btnLightboxModeShot.style.background = "#0284c7";
-            btnLightboxModeShot.style.color = "white";
-        }
-        if (btnLightboxModeKf) {
-            btnLightboxModeKf.style.background = "rgba(30, 41, 59, 0.8)";
-            btnLightboxModeKf.style.color = "#94a3b8";
-        }
-        if (lightboxShotBox) lightboxShotBox.style.display = "flex";
-        if (lightboxZoomBox) lightboxZoomBox.style.display = "none";
-        if (lightboxCanvasControls) lightboxCanvasControls.style.display = "none";
-        if (lightboxShotControls) lightboxShotControls.style.display = "flex";
-
-        if (lightboxShotVideo) {
-            const vUrl = item.video_url || `http://localhost:8000/cut_videos/${item.cut_file}`;
-            if (lightboxShotVideo.src !== vUrl) {
-                lightboxShotVideo.src = vUrl;
-            }
-            lightboxShotVideo.currentTime = 0;
-            lightboxShotVideo.play().catch(e => console.warn("Shot autoplay blocked:", e));
-        }
-    } else {
-        if (btnLightboxModeKf) {
-            btnLightboxModeKf.style.background = "#3b82f6";
-            btnLightboxModeKf.style.color = "white";
-        }
-        if (btnLightboxModeShot) {
-            btnLightboxModeShot.style.background = "rgba(30, 41, 59, 0.8)";
-            btnLightboxModeShot.style.color = "#94a3b8";
-        }
-        if (lightboxShotVideo) {
-            lightboxShotVideo.pause();
-        }
-        if (lightboxShotBox) lightboxShotBox.style.display = "none";
-        if (lightboxZoomBox) lightboxZoomBox.style.display = "block";
-        if (lightboxCanvasControls) lightboxCanvasControls.style.display = "flex";
-        if (lightboxShotControls) lightboxShotControls.style.display = "none";
-
-        const imgUrl = item.thumbnail_url || item.image_url || `http://localhost:8000/images/${item.video_id}/${bestFid}.jpg`;
-        if (lightboxImg) {
-            lightboxImg.src = imgUrl;
-            if (lightboxImg.complete) {
-                setTimeout(drawLightboxCanvas, 50);
-            } else {
-                lightboxImg.onload = () => setTimeout(drawLightboxCanvas, 50);
-            }
+    const imgUrl = item.thumbnail_url || item.image_url || `http://localhost:8000/images/${item.video_id}/${bestFid}.jpg`;
+    if (lightboxImg) {
+        lightboxImg.src = imgUrl;
+        if (lightboxImg.complete) {
+            setTimeout(drawLightboxCanvas, 50);
+        } else {
+            lightboxImg.onload = () => setTimeout(drawLightboxCanvas, 50);
         }
     }
 }
@@ -2687,8 +2915,6 @@ async function openLightbox(index, sourceList = currentResults) {
 
     currentLightboxIndex = index;
     const item = activeResultsSource[currentLightboxIndex];
-    const isShotItem = Boolean(item.shot_id || item.video_url || item.cut_file);
-
     let bestFid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id || "";
     if (typeof bestFid === "number") {
         bestFid = String(bestFid).padStart(6, "0");
@@ -2723,15 +2949,17 @@ async function openLightbox(index, sourceList = currentResults) {
         const rVis = item.rank_vis !== undefined && item.rank_vis !== null ? `#${item.rank_vis}` : '-';
         const rAsr = item.rank_asr !== undefined && item.rank_asr !== null ? `#${item.rank_asr}` : '-';
         const rShot = item.rank_shot !== undefined && item.rank_shot !== null ? `#${item.rank_shot}` : '-';
+        const rCaption = item.rank_caption !== undefined && item.rank_caption !== null ? `#${item.rank_caption}` : (item.caption_available ? '—' : 'N/A');
         ranksStrip.innerHTML = `
             <span style="background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); border-radius: 4px; padding: 2px 7px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace;" title="Thứ hạng Visual Search">👁️ Visual: ${rVis}</span>
             <span style="background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); border-radius: 4px; padding: 2px 7px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace;" title="Thứ hạng ASR Search">🎙️ ASR: ${rAsr}</span>
             <span style="background: rgba(14, 165, 233, 0.2); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.4); border-radius: 4px; padding: 2px 7px; font-size: 0.75rem; font-family: 'JetBrains Mono', monospace;" title="Thứ hạng Video Shot Search">🎬 Shot: ${rShot}</span>
+            ${rrfSignalCaption?.checked ? `<span style="color:#fbbf24;font-size:0.75rem" title="N/A: shot chưa có caption; —: có caption nhưng không vào danh sách hit">📝 Caption: ${rCaption}</span>` : ''}
         `;
     }
 
     if (copyStatus) copyStatus.innerText = "";
-    
+
     let asrDisplay = "Không có lời thoại phân đoạn này.";
     if (item.asr_transcript) {
         asrDisplay = `"${item.asr_transcript}"`;
@@ -2759,46 +2987,17 @@ async function openLightbox(index, sourceList = currentResults) {
         }
     }
 
-    renderBoxPills(item.boxes);
+    renderBoxPills([]);
 
     // Mở modal trước để layout tính đúng clientWidth / clientHeight
     lightboxModal.style.display = "flex";
 
-    // Xử lý hiển thị Video Shot vs Keyframe (mặc định mở theo chế độ currentViewMode)
-    if (isShotItem) {
-        if (lightboxMediaSwitcher) lightboxMediaSwitcher.style.display = "flex";
-        setLightboxMediaMode(currentViewMode === "shot" ? "shot" : "kf", item, bestFid);
-    } else {
-        if (lightboxMediaSwitcher) lightboxMediaSwitcher.style.display = "none";
-        setLightboxMediaMode("kf", item, bestFid);
-    }
+    showLightboxKeyframe(item, bestFid);
 
-    // Nếu item.boxes chưa có, gọi API lấy on-demand
-    if ((!item.boxes || item.boxes.length === 0) && bestFid) {
-        try {
-            const bRes = await fetch(`http://localhost:8000/api/keyframe-boxes/${item.video_id}/${bestFid}`);
-            if (bRes.ok) {
-                const bData = await bRes.json();
-                if (bData.status === "success" && bData.boxes && bData.boxes.length > 0) {
-                    item.boxes = bData.boxes;
-                    renderBoxPills(item.boxes);
-                    if (currentLightboxMediaMode === "kf") {
-                        setTimeout(drawLightboxCanvas, 30);
-                    }
-                }
-            }
-        } catch (e) {
-            console.warn("Could not fetch boxes on demand", e);
-        }
-    }
 }
 
 function closeLightbox() {
     resetZoom();
-    if (lightboxShotVideo) {
-        lightboxShotVideo.pause();
-        lightboxShotVideo.src = "";
-    }
     if (lightboxModal) lightboxModal.style.display = "none";
 }
 
@@ -2992,36 +3191,90 @@ if (lightboxTimelineBtn) {
 // ==========================================================================
 // VIDEO PLAYER (TRÌNH PHÁT VIDEO HTML5 TỰ ĐỘNG SEEK ĐẾN KEYFRAME)
 // ==========================================================================
-function openVideoPlayer(videoId, frameId, timestampSec) {
+function _cancelVideoBadgeLoop() {
+    if (_videoBadgeRafId !== null) {
+        cancelAnimationFrame(_videoBadgeRafId);
+        _videoBadgeRafId = null;
+    }
+}
+
+function _updateLiveVideoBadge(force = false) {
+    if (!html5VideoPlayer || !currentPlayingVideoId) return;
+    const now = performance.now();
+    if (force || now - _lastBadgeUpdate >= 200) {
+        _lastBadgeUpdate = now;
+        const fps = _videoFpsCache[String(currentPlayingVideoId).toUpperCase()] || 25.0;
+        const currentSec = Number(html5VideoPlayer.currentTime) || 0;
+        const currentMs = Math.round(currentSec * 1000);
+        const currentFrame = Math.round(currentSec * fps);
+        const mins = String(Math.floor(currentSec / 60)).padStart(2, "0");
+        const secs = String(Math.floor(currentSec % 60)).padStart(2, "0");
+        if (videoTimeBadge) {
+            videoTimeBadge.innerText = `⏱️ ${mins}:${secs} (${currentMs}ms) F:${String(currentFrame).padStart(6, "0")}`;
+        }
+    }
+    if (!html5VideoPlayer.paused && !html5VideoPlayer.ended) {
+        _videoBadgeRafId = requestAnimationFrame(() => _updateLiveVideoBadge(false));
+    } else {
+        _videoBadgeRafId = null;
+    }
+}
+
+function _flashVideoOutline(color, durationMs = 1000) {
+    if (!html5VideoPlayer) return;
+    if (_videoOutlineTimer) clearTimeout(_videoOutlineTimer);
+    html5VideoPlayer.style.outline = `3px solid ${color}`;
+    _videoOutlineTimer = setTimeout(() => {
+        if (html5VideoPlayer) html5VideoPlayer.style.outline = "";
+        _videoOutlineTimer = null;
+    }, durationMs);
+}
+
+function openVideoPlayer(videoId, frameId, timestampSec, leadInSec = 1.5) {
     if (!videoId) return;
     currentPlayingVideoId = videoId;
     currentPlayingFrameId = frameId;
     currentPlayingTimestamp = (timestampSec !== undefined && timestampSec !== null) ? Number(timestampSec) : 0;
+    void getVideoFpsWithCache(videoId).then(() => _updateLiveVideoBadge(true));
 
     const mins = Math.floor(currentPlayingTimestamp / 60);
     const secs = Math.floor(currentPlayingTimestamp % 60);
     const timeStr = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 
-    if (videoPlayerTitle) videoPlayerTitle.innerText = `▶️ VIDEO: ${videoId}.mp4`;
+    if (videoPlayerTitle) videoPlayerTitle.innerText = `▶️ VIDEO: ${videoId}`;
     if (videoTimeBadge) videoTimeBadge.innerText = `⏱️ Keyframe: ${timeStr} (${currentPlayingTimestamp}s)`;
 
     if (html5VideoPlayer) {
-        html5VideoPlayer.src = `${VIDEO_STREAM_URL}/${videoId}.mp4`;
+        html5VideoPlayer.onerror = () => {
+            if (currentPlayingVideoId !== videoId) return;
+            showToast(`❌ Không tìm thấy hoặc không phát được video: ${videoId}`, "error", 4000);
+            closeVideoPlayer();
+        };
         html5VideoPlayer.onloadedmetadata = () => {
-            // Tua lùi lại 1.5 giây để người dùng quan sát được hành động trước keyframe
-            html5VideoPlayer.currentTime = Math.max(0, currentPlayingTimestamp - 1.5);
+            // Luồng kết quả giữ lead-in 1.5s; Quick Opener/Event Jump truyền 0 để đến đúng mốc.
+            html5VideoPlayer.currentTime = Math.max(0, currentPlayingTimestamp - Math.max(0, Number(leadInSec) || 0));
             html5VideoPlayer.playbackRate = parseFloat(videoSpeedSelect ? videoSpeedSelect.value : 1.0);
             html5VideoPlayer.play().catch(err => console.log("Autoplay blocked:", err));
         };
+        html5VideoPlayer.src = `http://localhost:8000/api/video-file/${encodeURIComponent(videoId)}`;
     }
 
     if (videoModal) videoModal.style.display = "flex";
 }
 
 function closeVideoPlayer() {
+    _cancelVideoBadgeLoop();
+    if (_videoOutlineTimer) {
+        clearTimeout(_videoOutlineTimer);
+        _videoOutlineTimer = null;
+    }
     if (html5VideoPlayer) {
         html5VideoPlayer.pause();
-        html5VideoPlayer.src = "";
+        html5VideoPlayer.onerror = null;
+        html5VideoPlayer.onloadedmetadata = null;
+        html5VideoPlayer.style.outline = "";
+        html5VideoPlayer.removeAttribute("src");
+        html5VideoPlayer.load();
     }
     if (videoModal) videoModal.style.display = "none";
 }
@@ -3065,32 +3318,460 @@ if (videoSpeedSelect) {
     });
 }
 
+if (html5VideoPlayer) {
+    html5VideoPlayer.addEventListener("play", () => {
+        _cancelVideoBadgeLoop();
+        _videoBadgeRafId = requestAnimationFrame(() => _updateLiveVideoBadge(true));
+    });
+    html5VideoPlayer.addEventListener("pause", () => {
+        _cancelVideoBadgeLoop();
+        _updateLiveVideoBadge(true);
+    });
+    html5VideoPlayer.addEventListener("ended", _cancelVideoBadgeLoop);
+    html5VideoPlayer.addEventListener("seeked", () => _updateLiveVideoBadge(true));
+
+    html5VideoPlayer.addEventListener("click", async (event) => {
+        if (!(event.ctrlKey || event.metaKey) || !currentPlayingVideoId) return;
+        event.preventDefault();
+        event.stopPropagation();
+
+        const currentSec = Number(html5VideoPlayer.currentTime) || 0;
+        const fps = await getVideoFpsWithCache(currentPlayingVideoId);
+        // Video cho phep chon frame chinh xac nam GIUA hai keyframe da trich xuat.
+        // Khong snap ve timeline KF, vi do thua sampling chinh la nguon sai lech 0.5-1s.
+        const frameId = String(Math.round(currentSec * fps)).padStart(6, "0");
+        const currentMode = dresTaskModeSelect ? dresTaskModeSelect.value : "kis";
+
+        if (currentMode === "kis") {
+            html5VideoPlayer.pause();
+            _flashVideoOutline("#10b981", 1200);
+            showToast(`⚡ KIS: ${currentPlayingVideoId} / F:${frameId} (${currentSec.toFixed(2)}s)`, "info", 1500);
+            await triggerDresSubmit(currentPlayingVideoId, frameId, null);
+            return;
+        }
+
+        if (currentMode === "qa") {
+            html5VideoPlayer.pause();
+            _flashVideoOutline("#38bdf8", 1200);
+            handleDresFastSubmit(currentPlayingVideoId, frameId, null);
+            return;
+        }
+
+        if (currentMode === "trake") {
+            if (trakeTimelineState.videoId
+                && trakeTimelineState.videoId !== currentPlayingVideoId
+                && trakeTimelineState.selectedFrames.length > 0) {
+                const shouldReplace = confirm(
+                    `Chuỗi TRAKE hiện tại thuộc "${trakeTimelineState.videoId}". Chuyển sang "${currentPlayingVideoId}" và xóa chuỗi cũ?`
+                );
+                if (!shouldReplace) return;
+                trakeTimelineState.selectedFrames = [];
+            }
+
+            trakeTimelineState.videoId = currentPlayingVideoId;
+            const existingIdx = trakeTimelineState.selectedFrames.findIndex(
+                item => String(item.frame_id) === frameId
+            );
+            if (existingIdx >= 0) {
+                trakeTimelineState.selectedFrames.splice(existingIdx, 1);
+                _flashVideoOutline("#ef4444", 800);
+                showToast(`↺ Bỏ chọn F:${frameId} khỏi chuỗi TRAKE`, "info", 1200);
+            } else {
+                trakeTimelineState.selectedFrames.push({
+                    frame_id: frameId,
+                    timestamp_sec: Number(currentSec.toFixed(3)),
+                    element: null
+                });
+                _flashVideoOutline("#a855f7", 800);
+                showToast(
+                    `✨ E${trakeTimelineState.selectedFrames.length}: F:${frameId} (${currentSec.toFixed(2)}s) đã thêm`,
+                    "success",
+                    1500
+                );
+            }
+            if (trakeTimelineBar) trakeTimelineBar.style.display = "flex";
+            updateTrakeTimelineUi();
+        }
+    });
+}
+
 if (videoCopyBtn) {
     videoCopyBtn.addEventListener("click", () => {
         if (currentPlayingVideoId && currentPlayingFrameId) {
             const textToCopy = `${currentPlayingVideoId} ${currentPlayingFrameId}`;
             navigator.clipboard.writeText(textToCopy).then(() => {
-                videoTimeBadge.innerText = `✅ Đã chép: ${textToCopy}`;
-                setTimeout(() => {
-                    const mins = Math.floor(currentPlayingTimestamp / 60);
-                    const secs = Math.floor(currentPlayingTimestamp % 60);
-                    videoTimeBadge.innerText = `⏱️ Keyframe: ${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')} (${currentPlayingTimestamp}s)`;
-                }, 2000);
+                showToast(`📋 Đã chép: ${textToCopy}`, "success", 1500);
             });
         }
     });
 }
 
+let activeQuickVideoTab = "verify";
+
+function setQuickVideoTab(tabName) {
+    activeQuickVideoTab = tabName === "submit" ? "submit" : "verify";
+    quickVideoTabs.forEach(tab => tab.classList.toggle("active", tab.dataset.quickTab === activeQuickVideoTab));
+    quickVideoVerifyPanel?.classList.toggle("active", activeQuickVideoTab === "verify");
+    quickVideoSubmitPanel?.classList.toggle("active", activeQuickVideoTab === "submit");
+}
+
+function setQuickVideoMapStatus(message, kind = "") {
+    if (!quickVideoMapStatus) return;
+    quickVideoMapStatus.innerText = message;
+    quickVideoMapStatus.classList.toggle("is-ok", kind === "ok");
+    quickVideoMapStatus.classList.toggle("is-warning", kind === "warning");
+}
+
+function openQuickVideoOpener(initialTab = "verify") {
+    if (!quickVideoOverlay) return;
+    setQuickVideoTab(initialTab);
+    quickVideoOverlay.style.display = "flex";
+    if (currentPlayingVideoId && quickVideoIdInput && !quickVideoIdInput.value.trim()) {
+        quickVideoIdInput.value = currentPlayingVideoId;
+    }
+    setTimeout(() => {
+        if (quickVideoIdInput?.value.trim()) quickVideoTimeInput?.focus();
+        else quickVideoIdInput?.focus();
+    }, 60);
+}
+
+function closeQuickVideoOpener() {
+    if (quickVideoOverlay) quickVideoOverlay.style.display = "none";
+}
+
+function normalizeQuickVideoId(rawVideoId) {
+    const videoId = String(rawVideoId || "").trim().toUpperCase().replace(/\.MP4$/i, "");
+    return /^[A-Z0-9_-]+$/.test(videoId) ? videoId : "";
+}
+
+async function parseQuickFrameInput(rawValue, videoId) {
+    const value = String(rawValue || "").trim().toLowerCase();
+    if (!value) return [];
+
+    // Danh sach so cach nhau bang dau phay duoc hieu la chuoi KF TRAKE.
+    if (value.includes(",")) {
+        const ids = value.split(",").map(item => item.trim().replace(/^f[:\s]?/, ""));
+        if (ids.some(item => !/^\d+$/.test(item))) return null;
+        return ids.map(item => Number.parseInt(item, 10));
+    }
+
+    const frameMatch = value.match(/^f[:\s]?(\d+)$/) || value.match(/^(\d+)$/);
+    if (frameMatch) return [Number.parseInt(frameMatch[1], 10)];
+
+    let timeSec = null;
+    const explicitSeconds = value.match(/^t[:\s]?(\d+(?:\.\d+)?)$/);
+    const mmssMatch = value.match(/^(\d+):(\d{1,2}(?:\.\d+)?)$/);
+    if (explicitSeconds) {
+        timeSec = Number.parseFloat(explicitSeconds[1]);
+    } else if (mmssMatch) {
+        const seconds = Number.parseFloat(mmssMatch[2]);
+        if (seconds >= 60) return null;
+        timeSec = Number.parseInt(mmssMatch[1], 10) * 60 + seconds;
+    }
+    if (!Number.isFinite(timeSec) || timeSec < 0) return null;
+    const fps = await getVideoFpsWithCache(videoId);
+    return [Math.round(timeSec * fps)];
+}
+
+async function resolveFrameAgainstMap(videoId, frameId = null) {
+    const suffix = frameId === null ? "" : `?frame_id=${encodeURIComponent(frameId)}`;
+    const response = await fetch(`${KEYFRAME_RESOLVE_API}/${encodeURIComponent(videoId)}${suffix}`);
+    if (!response.ok) throw new Error(`Resolver HTTP ${response.status}`);
+    const data = await response.json();
+    if (data.status !== "success") throw new Error(data.message || "Không đối chiếu được keyframe map.");
+    return data;
+}
+
+function renderResolvedMapStatus(resolutions) {
+    if (!resolutions.length) return;
+    const first = resolutions[0];
+    if (!first.video_file_exists && !first.keyframe_map_exists) {
+        setQuickVideoMapStatus(`Không tìm thấy video ${first.video_id} trong video gốc hoặc keyframe map.`, "warning");
+        return;
+    }
+    const fpsText = first.actual_video_fps
+        ? `${first.mapped_fps} FPS map / ${first.actual_video_fps} FPS MP4`
+        : `${first.mapped_fps} FPS map`;
+    const frameText = resolutions.map(item => {
+        if (!item.requested_frame_id) return "không chỉ định KF";
+        return item.exact_match
+            ? `F:${item.resolved_frame_id} ✓`
+            : `F:${item.requested_frame_id} → gần nhất F:${item.resolved_frame_id} (Δ${item.frame_delta})`;
+    }).join(" · ");
+    const warning = first.fps_mismatch || resolutions.some(item => item.requested_frame_id && !item.exact_match);
+    setQuickVideoMapStatus(`${first.video_id} · ${frameText} · ${fpsText}`, warning ? "warning" : "ok");
+}
+
+async function resolveQuickVideoTargets({ allowMultiple = false } = {}) {
+    const videoId = normalizeQuickVideoId(quickVideoIdInput?.value);
+    if (!videoId) {
+        showToast("⚠️ Video ID không hợp lệ. Ví dụ: L26_V001", "warning");
+        quickVideoIdInput?.focus();
+        return null;
+    }
+    const frameIds = await parseQuickFrameInput(quickVideoTimeInput?.value, videoId);
+    if (frameIds === null || (!allowMultiple && frameIds.length > 1)) {
+        showToast("⚠️ KF không hợp lệ. Dùng 003600, F:3600, T:150 hoặc 02:30.", "warning");
+        quickVideoTimeInput?.focus();
+        return null;
+    }
+
+    setQuickVideoMapStatus("Đang đối chiếu keyframe map và FPS MP4...");
+    try {
+        const requested = frameIds.length ? frameIds : [null];
+        const resolutions = await Promise.all(requested.map(frameId => resolveFrameAgainstMap(videoId, frameId)));
+        renderResolvedMapStatus(resolutions);
+        if (!resolutions[0].video_file_exists && !resolutions[0].keyframe_map_exists) {
+            showToast(`⚠️ Không tìm thấy video ${videoId}.`, "warning");
+            return null;
+        }
+        const outOfRange = resolutions.find(item => item.requested_in_video_range === false);
+        if (outOfRange) {
+            showToast(
+                `⚠️ F:${outOfRange.requested_frame_id} nằm ngoài video (${outOfRange.video_frame_count} frames).`,
+                "warning"
+            );
+            return null;
+        }
+        const first = resolutions[0];
+        const submissionFrameIds = resolutions
+            .map(item => item.requested_frame_id || item.resolved_frame_id)
+            .filter(Boolean);
+        const firstFrameNumber = submissionFrameIds.length ? Number.parseInt(submissionFrameIds[0], 10) : null;
+        return {
+            videoId,
+            resolutions,
+            // Nop/mo video giu dung frame nguoi dung nhap; nearest KF chi de
+            // doi chieu va lam dich cuon timeline.
+            frameIds: submissionFrameIds,
+            frameId: submissionFrameIds[0] || null,
+            timelineFrameId: first.resolved_frame_id || submissionFrameIds[0] || null,
+            timeSec: firstFrameNumber === null ? 0 : firstFrameNumber / Number(first.mapped_fps || 25)
+        };
+    } catch (error) {
+        setQuickVideoMapStatus(error.message, "warning");
+        showToast(`⚠️ ${error.message}`, "warning");
+        return null;
+    }
+}
+
+window.addEventListener("keydown", (event) => {
+    if (event.altKey && event.code === "KeyG") {
+        event.preventDefault();
+        if (quickVideoOverlay?.style.display === "flex") closeQuickVideoOpener();
+        else openQuickVideoOpener();
+        return;
+    }
+    if (event.key === "Escape" && quickVideoOverlay?.style.display === "flex") {
+        event.preventDefault();
+        closeQuickVideoOpener();
+    }
+});
+
+quickVideoOpenBtn?.addEventListener("click", () => openQuickVideoOpener("verify"));
+quickVideoCloseBtn?.addEventListener("click", closeQuickVideoOpener);
+quickVideoTabs.forEach(tab => tab.addEventListener("click", () => setQuickVideoTab(tab.dataset.quickTab)));
+
+quickVideoOverlay?.addEventListener("click", (event) => {
+    if (event.target === quickVideoOverlay) closeQuickVideoOpener();
+});
+
+quickVideoIdInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+        event.preventDefault();
+        quickVideoTimeInput?.focus();
+    }
+});
+
+quickVideoTimeInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+        event.preventDefault();
+        if (activeQuickVideoTab === "submit") btnQuickVideoSubmit?.click();
+        else btnQuickVideoGo?.click();
+    }
+});
+
+btnQuickVideoGo?.addEventListener("click", async () => {
+    const target = await resolveQuickVideoTargets();
+    if (!target) return;
+    closeQuickVideoOpener();
+    openVideoPlayer(target.videoId, target.frameId, target.timeSec, 0);
+});
+
+btnQuickVideoTimeline?.addEventListener("click", async () => {
+    const target = await resolveQuickVideoTargets();
+    if (!target) return;
+    closeQuickVideoOpener();
+    if (videoModal?.style.display !== "none") closeVideoPlayer();
+    if (lightboxModal?.style.display !== "none") closeLightbox();
+    openTimeline(target.videoId, target.timelineFrameId);
+});
+
+btnQuickVideoSubmit?.addEventListener("click", async () => {
+    const mode = quickSubmitMode?.value || "kis";
+    const target = await resolveQuickVideoTargets({ allowMultiple: mode === "trake" });
+    if (!target) return;
+
+    if (mode === "trake") {
+        if (target.frameIds.length < 2) {
+            showToast("⚠️ TRAKE cần ít nhất 2 KF ID cách nhau bằng dấu phẩy.", "warning");
+            return;
+        }
+        closeQuickVideoOpener();
+        triggerDresTrakeSubmit(target.videoId, target.frameIds, null);
+        return;
+    }
+    if (!target.frameId) {
+        showToast("⚠️ Hãy nhập KF ID trước khi nộp.", "warning");
+        return;
+    }
+
+    closeQuickVideoOpener();
+    if (mode === "qa") {
+        openQaSubmissionModal(target.videoId, target.frameId, null);
+    } else {
+        triggerDresSubmit(target.videoId, target.frameId, null);
+    }
+});
+
 // ==========================================================================
 // TIMELINE BROWSER (CHIẾN THUẬT 5 + AUTO-SCROLL & HIGHLIGHT ĐẾN ĐÚNG FRAME)
 // ==========================================================================
-async function openTimeline(videoId, targetFrameId = null) {
+// ==========================================================================
+// TIMELINE BROWSER (CHIẾN THUẬT 5 + TRAKE EVENT SELECTION + AUTO-SCROLL)
+// ==========================================================================
+let trakeTimelineState = {
+    videoId: "",
+    selectedFrames: [] // [{ frame_id, timestamp_sec, element }]
+};
+
+const trakeTimelineBar = document.getElementById("trake-timeline-bar");
+const trakeSelectedChainText = document.getElementById("trake-selected-chain-text");
+const trakeEventPills = document.getElementById("trake-event-pills");
+const btnTrakeSubmitDres = document.getElementById("btn-trake-submit-dres");
+const btnTrakeClearSelection = document.getElementById("btn-trake-clear-selection");
+
+function updateTrakeTimelineUi() {
+    if (!trakeTimelineBar) return;
+
+    // Xóa toàn bộ badge cũ và class trake-selected
+    document.querySelectorAll(".timeline-item").forEach(item => {
+        item.classList.remove("trake-selected");
+        const existingBadge = item.querySelector(".timeline-trake-badge");
+        if (existingBadge) existingBadge.remove();
+    });
+
+    // Đánh số neon E1, E2, E3... theo thứ tự thời gian đã chọn
+    trakeTimelineState.selectedFrames.forEach((item, idx) => {
+        const el = item.element || document.querySelector(`.timeline-item[data-frame-id="${item.frame_id}"]`);
+        if (el) {
+            el.classList.add("trake-selected");
+            const thumbBox = el.querySelector(".timeline-thumb-box");
+            if (thumbBox && !thumbBox.querySelector(".timeline-trake-badge")) {
+                const b = document.createElement("span");
+                b.className = "timeline-trake-badge";
+                b.innerText = `E${idx + 1}`;
+                thumbBox.appendChild(b);
+            }
+        }
+    });
+
+    if (trakeEventPills) {
+        trakeEventPills.innerHTML = "";
+        trakeTimelineState.selectedFrames.forEach((item, idx) => {
+            const timestampSec = Number(item.timestamp_sec) || 0;
+            const mins = String(Math.floor(timestampSec / 60)).padStart(2, "0");
+            const secs = String(Math.floor(timestampSec % 60)).padStart(2, "0");
+            const pill = document.createElement("button");
+            pill.type = "button";
+            pill.className = "trake-event-pill";
+            pill.innerText = `E${idx + 1} ${mins}:${secs} →`;
+            pill.title = `E${idx + 1}: F:${item.frame_id} (${timestampSec.toFixed(3)}s) — tua video tới sự kiện`;
+            pill.setAttribute("aria-label", `Tua video tới sự kiện E${idx + 1} tại ${mins}:${secs}`);
+            pill.addEventListener("click", () => {
+                const isSameOpenVideo = videoModal?.style.display !== "none"
+                    && currentPlayingVideoId === trakeTimelineState.videoId
+                    && html5VideoPlayer;
+                if (isSameOpenVideo) {
+                    html5VideoPlayer.currentTime = timestampSec;
+                    _updateLiveVideoBadge(true);
+                    showToast(`⏱️ Tua về E${idx + 1}: ${mins}:${secs}`, "info", 1000);
+                } else {
+                    openVideoPlayer(trakeTimelineState.videoId, item.frame_id, timestampSec, 0);
+                    showToast(`▶ Mở video tại E${idx + 1}: ${mins}:${secs}`, "info", 1200);
+                }
+            });
+            trakeEventPills.appendChild(pill);
+        });
+    }
+
+    if (trakeTimelineState.selectedFrames.length === 0) {
+        if (trakeSelectedChainText) trakeSelectedChainText.innerText = "Chưa chọn frame nào (Ctrl+Click để chọn theo thứ tự E1, E2, E3...)";
+        if (btnTrakeSubmitDres) {
+            btnTrakeSubmitDres.disabled = true;
+            btnTrakeSubmitDres.innerText = "🚀 NỘP CHUỖI TRAKE";
+        }
+    } else {
+        if (trakeSelectedChainText) {
+            trakeSelectedChainText.innerText = `${trakeTimelineState.videoId} · ${trakeTimelineState.selectedFrames.length} sự kiện`;
+        }
+        if (btnTrakeSubmitDres) {
+            const count = trakeTimelineState.selectedFrames.length;
+            btnTrakeSubmitDres.disabled = (count < 2);
+            btnTrakeSubmitDres.innerText = count < 2
+                ? `🚀 CẦN ÍT NHẤT 2 SỰ KIỆN (${count}/2)`
+                : `🚀 NỘP CHUỖI TRAKE (${count} sự kiện • Ctrl+Enter)`;
+        }
+    }
+
+    if (videoTrakeSubmitBtn) {
+        const count = trakeTimelineState.selectedFrames.length;
+        videoTrakeSubmitBtn.disabled = count < 2;
+        videoTrakeSubmitBtn.innerText = count < 2
+            ? `🚀 TRAKE (${count}/2)`
+            : `🚀 NỘP CHUỖI TRAKE (${count})`;
+    }
+}
+
+function toggleTrakeTimelineItem(f, itemDiv) {
+    const existingIdx = trakeTimelineState.selectedFrames.findIndex(x => String(x.frame_id) === String(f.frame_id));
+    if (existingIdx >= 0) {
+        trakeTimelineState.selectedFrames.splice(existingIdx, 1);
+        showToast(`↺ Đã bỏ chọn Frame ${f.frame_id}`, "info", 1200);
+    } else {
+        trakeTimelineState.selectedFrames.push({
+            frame_id: f.frame_id,
+            timestamp_sec: f.timestamp_sec,
+            element: itemDiv
+        });
+        showToast(`✨ Đã thêm Frame ${f.frame_id} (E${trakeTimelineState.selectedFrames.length}) vào chuỗi TRAKE`, "success", 1200);
+    }
+    // TUYỆT ĐỐI KHÔNG sort theo timestamp để bảo toàn 100% thứ tự click của người dùng:
+    // Sự kiện chọn đầu tiên luôn là E1, sự kiện tiếp theo là E2, E3...
+    updateTrakeTimelineUi();
+}
+
+async function openTimeline(videoId, targetFrameId = null, activateTrake = false) {
     if (!videoId) return;
 
     if (timelineVideoTitle) timelineVideoTitle.innerText = `🎞️ TIMELINE: ${videoId}`;
     if (timelineFrameCount) timelineFrameCount.innerText = "Đang tải...";
     if (timelineStrip) timelineStrip.innerHTML = `<div style="padding: 30px; font-weight: bold; width: 100%; text-align: center;">⏳ Đang tải toàn bộ keyframes của video ${videoId}...</div>`;
     if (timelineModal) timelineModal.style.display = "flex";
+
+    const isTrakeMode = activateTrake || (typeof dresTaskModeSelect !== "undefined" && dresTaskModeSelect && dresTaskModeSelect.value === "trake");
+    const isSameTrakeVideo = trakeTimelineState.videoId === videoId;
+    if (!isSameTrakeVideo) {
+        trakeTimelineState.selectedFrames = [];
+    } else {
+        // Timeline DOM sẽ được dựng lại; giữ selection nhưng bỏ tham chiếu node cũ.
+        trakeTimelineState.selectedFrames.forEach(frame => { frame.element = null; });
+    }
+    trakeTimelineState.videoId = videoId;
+
+    if (trakeTimelineBar) {
+        trakeTimelineBar.style.display = isTrakeMode ? "flex" : "none";
+    }
 
     try {
         const resp = await fetch(`${TIMELINE_URL}/${videoId}`);
@@ -3112,15 +3793,49 @@ async function openTimeline(videoId, targetFrameId = null) {
         frames.forEach((f, fIdx) => {
             const itemDiv = document.createElement("div");
             itemDiv.className = "timeline-item";
+            itemDiv.dataset.frameId = f.frame_id;
 
-            // Nếu đây là frame được bấm mở từ thẻ kết quả -> Đánh dấu active
-            if (targetFrameId && f.frame_id === targetFrameId) {
+            // Nếu đây là frame được bấm mở từ thẻ kết quả -> Đánh dấu active và chuẩn bị cuộn tới
+            if (targetFrameId && String(f.frame_id) === String(targetFrameId)) {
                 itemDiv.classList.add("timeline-item-active");
                 targetElementToScroll = itemDiv;
+                // Lưu ý: Không tự động chèn targetFrameId vào selectedFrames để người dùng
+                // toàn quyền chủ động chọn thứ tự E1, E2, E3... bằng Ctrl+Click
             }
 
-            // Click vào thẻ keyframe để mở Lightbox soi chi tiết (nổi lên trên tab timeline)
-            itemDiv.addEventListener("click", () => {
+            // Click vào thẻ keyframe:
+            // - Nếu giữ Ctrl/Meta: Tuân theo đúng chế độ nộp hiện tại (KIS / QA / TRAKE)
+            // - Nếu click thường: Mở Lightbox soi chi tiết
+            itemDiv.addEventListener("click", (e) => {
+                if (e.ctrlKey || e.metaKey) {
+                    e.stopPropagation();
+                    e.preventDefault();
+
+                    const currentModeNow = (typeof dresTaskModeSelect !== "undefined" && dresTaskModeSelect)
+                        ? dresTaskModeSelect.value
+                        : "kis";
+
+                    if (currentModeNow === "kis") {
+                        // KIS MODE: Nộp trực tiếp lập tức lên DRES
+                        showToast(`⚡ Đang nộp KIS từ Timeline: ${videoId} / Frame ${f.frame_id}`, "info", 1500);
+                        itemDiv.style.outline = "2px solid #f59e0b";
+                        handleDresFastSubmit(videoId, f.frame_id, itemDiv);
+                        return;
+                    }
+
+                    if (currentModeNow === "qa") {
+                        // QA MODE: Mở modal nhập đáp án QA cho frame này
+                        handleDresFastSubmit(videoId, f.frame_id, itemDiv);
+                        return;
+                    }
+
+                    if (currentModeNow === "trake") {
+                        // TRAKE MODE: Chọn sự kiện E1, E2, E3...
+                        if (trakeTimelineBar) trakeTimelineBar.style.display = "flex";
+                        toggleTrakeTimelineItem(f, itemDiv);
+                        return;
+                    }
+                }
                 openLightbox(fIdx, frames);
             });
 
@@ -3130,7 +3845,7 @@ async function openTimeline(videoId, targetFrameId = null) {
             const asrIcon = f.asr_transcript ? `🎙️ ` : `⏱️ `;
 
             itemDiv.innerHTML = `
-                <div class="timeline-thumb-box" title="🔍 Bấm để soi chi tiết">
+                <div class="timeline-thumb-box" title="🔍 Bấm để soi chi tiết | ⚡ Ctrl+Click: Chọn sự kiện TRAKE">
                     <img src="${f.image_url}" loading="lazy" alt="Frame ${f.frame_id}">
                     <span class="timeline-time-badge">${asrIcon}${timeStr}</span>
                 </div>
@@ -3141,6 +3856,10 @@ async function openTimeline(videoId, targetFrameId = null) {
             `;
             timelineStrip.appendChild(itemDiv);
         });
+
+        if (isTrakeMode) {
+            updateTrakeTimelineUi();
+        }
 
         // TỰ ĐỘNG CUỘN ĐẾN ĐÚNG VỊ TRÍ FRAME ĐÃ CHỌN
         if (targetElementToScroll) {
@@ -3164,6 +3883,50 @@ if (timelineCloseBtn) timelineCloseBtn.addEventListener("click", closeTimeline);
 if (timelineModal) {
     timelineModal.addEventListener("click", (e) => {
         if (e.target === timelineModal) closeTimeline();
+    });
+}
+
+// Bắt sự kiện thanh công cụ TRAKE Timeline
+const btnTrakeSortTime = document.getElementById("btn-trake-sort-time");
+if (btnTrakeSortTime) {
+    btnTrakeSortTime.addEventListener("click", () => {
+        if (!trakeTimelineState.selectedFrames || trakeTimelineState.selectedFrames.length <= 1) {
+            showToast("ℹ️ Cần chọn ít nhất 2 frame để sắp xếp theo thời gian!", "info", 1500);
+            return;
+        }
+        trakeTimelineState.selectedFrames.sort((a, b) => (Number(a.timestamp_sec) || 0) - (Number(b.timestamp_sec) || 0));
+        updateTrakeTimelineUi();
+        showToast("⏱️ Đã sắp xếp lại các sự kiện theo thứ tự thời gian tăng dần!", "success", 1500);
+    });
+}
+
+if (btnTrakeClearSelection) {
+    btnTrakeClearSelection.addEventListener("click", () => {
+        trakeTimelineState.selectedFrames = [];
+        updateTrakeTimelineUi();
+        showToast("↺ Đã làm mới chuỗi chọn TRAKE.", "info", 1500);
+    });
+}
+
+if (btnTrakeSubmitDres) {
+    btnTrakeSubmitDres.addEventListener("click", () => {
+        if (!trakeTimelineState.videoId || trakeTimelineState.selectedFrames.length < 2) {
+            showToast("⚠️ Cần chọn ít nhất 2 frame theo thứ tự thời gian để nộp TRAKE!", "warning");
+            return;
+        }
+        const frameIds = trakeTimelineState.selectedFrames.map(f => f.frame_id);
+        triggerDresTrakeSubmit(trakeTimelineState.videoId, frameIds, btnTrakeSubmitDres);
+    });
+}
+
+if (videoTrakeSubmitBtn) {
+    videoTrakeSubmitBtn.addEventListener("click", () => {
+        if (!trakeTimelineState.videoId || trakeTimelineState.selectedFrames.length < 2) {
+            showToast("⚠️ Cần chọn ít nhất 2 sự kiện TRAKE bằng Ctrl+Click vào video!", "warning");
+            return;
+        }
+        const frameIds = trakeTimelineState.selectedFrames.map(frame => frame.frame_id);
+        triggerDresTrakeSubmit(trakeTimelineState.videoId, frameIds, videoTrakeSubmitBtn);
     });
 }
 
@@ -3193,6 +3956,14 @@ window.addEventListener("keydown", (e) => {
     const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : "";
     if (activeTag === "input" || activeTag === "textarea") return;
 
+    if (dresQaModal && dresQaModal.style.display !== "none") {
+        if (e.key === "Escape") {
+            e.preventDefault();
+            dresQaModal.style.display = "none";
+            return;
+        }
+    }
+
     if (videoModal && videoModal.style.display !== "none") {
         if (e.key === "Escape") {
             closeVideoPlayer();
@@ -3200,6 +3971,13 @@ window.addEventListener("keydown", (e) => {
     } else if (lightboxModal && lightboxModal.style.display !== "none") {
         if (e.key === "Escape") {
             closeLightbox();
+        } else if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S" || e.key === "Enter")) {
+            e.preventDefault();
+            if (activeResultsSource && currentLightboxIndex >= 0 && currentLightboxIndex < activeResultsSource.length) {
+                const item = activeResultsSource[currentLightboxIndex];
+                const bestFid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id || 0;
+                handleDresFastSubmit(item.video_id, bestFid, lightboxDresBtn);
+            }
         } else if (e.key === "ArrowLeft") {
             e.preventDefault();
             if (currentLightboxIndex > 0) {
@@ -3210,25 +3988,21 @@ window.addEventListener("keydown", (e) => {
             if (activeResultsSource && currentLightboxIndex < activeResultsSource.length - 1) {
                 openLightbox(currentLightboxIndex + 1, activeResultsSource);
             }
-        } else if (e.key === " " || e.code === "Space") {
-            if (currentLightboxMediaMode === "shot" && lightboxShotVideo) {
-                e.preventDefault();
-                if (lightboxShotVideo.paused) {
-                    lightboxShotVideo.play();
-                } else {
-                    lightboxShotVideo.pause();
-                }
-            }
         }
     } else if (timelineModal && timelineModal.style.display !== "none") {
         if (e.key === "Escape") {
             closeTimeline();
+        } else if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+            e.preventDefault();
+            if (btnTrakeSubmitDres && !btnTrakeSubmitDres.disabled) {
+                btnTrakeSubmitDres.click();
+            }
         }
     }
 });
 
-// Bắt sự kiện phím Enter cho các ô tìm kiếm
-[searchInput, ocrInput, speechInput, videoIdInput, topKNum, visualSimNum].forEach(el => {
+// Visual Query có handler riêng để phân biệt truy vấn đơn cảnh và TRAKE nhiều đoạn.
+[ocrInput, speechInput, videoIdInput, topKNum, visualSimNum].forEach(el => {
     if (el) {
         el.addEventListener("keypress", (e) => {
             if (e.key === "Enter" && !e.shiftKey) {
@@ -3239,7 +4013,6 @@ window.addEventListener("keydown", (e) => {
     }
 });
 
-if (searchBtn) searchBtn.addEventListener("click", performSearch);
 if (multiSearchBtn) multiSearchBtn.addEventListener("click", performMultiSceneSearch);
 if (trakeSearchBtn) trakeSearchBtn.addEventListener("click", performTrakeSearch);
 if (trakeExportBtn) trakeExportBtn.addEventListener("click", exportTrakeCsv);
@@ -3264,6 +4037,13 @@ document.querySelectorAll('input[name="smart-submode"]').forEach(r => {
 
 // Khôi phục trạng thái bảng điều khiển từ localStorage khi khởi động
 restoreControlPanelState();
+
+// OCR đang ẩn: vô hiệu hóa cả state cũ trong localStorage để không âm thầm
+// tác động tới truy vấn trong khi người vận hành không nhìn thấy module này.
+if (!OCR_FEATURE_VISIBLE && enableOcrCheck) {
+    enableOcrCheck.checked = false;
+    enableOcrCheck.disabled = true;
+}
 
 // ==========================================================================
 // SUBMISSION MANAGER LOGIC & HANDLERS (AIC 2026 CONTEST SUITE)
@@ -3303,7 +4083,11 @@ if (subModePills) {
     subModePills.querySelectorAll(".btn-pill").forEach(btn => {
         btn.addEventListener("click", () => {
             const mode = btn.getAttribute("data-mode") || "kis";
-            switchSubMode(mode);
+            if (typeof setDresSubmissionMode === "function") {
+                setDresSubmissionMode(mode);
+            } else {
+                switchSubMode(mode);
+            }
         });
     });
 }
@@ -3567,6 +4351,16 @@ if (btnSubExportZip) {
 }
 
 // Nạp nhanh Keyframe từ Lightbox vào Submission Manager
+const lightboxDresBtn = document.getElementById("lightbox-dres-submit-btn");
+if (lightboxDresBtn) {
+    lightboxDresBtn.addEventListener("click", () => {
+        if (!activeResultsSource || currentLightboxIndex < 0 || currentLightboxIndex >= activeResultsSource.length) return;
+        const item = activeResultsSource[currentLightboxIndex];
+        const bestFid = item.best_kf_frame_id || item.anchor_frame_id || item.frame_id || 0;
+        handleDresFastSubmit(item.video_id, bestFid, lightboxDresBtn);
+    });
+}
+
 if (lightboxSubBtn) {
     lightboxSubBtn.addEventListener("click", () => {
         const item = activeResultsSource[currentLightboxIndex];
@@ -3929,9 +4723,12 @@ async function loadCategories() {
                 for (const [catKey, catInfo] of Object.entries(categoriesTaxonomy)) {
                     const opt = document.createElement("option");
                     opt.value = catKey;
-                    opt.innerText = catInfo.label || catKey;
+                    const count = Number.isFinite(Number(catInfo.count)) ? ` · ${catInfo.count}` : "";
+                    opt.innerText = `${catInfo.label || catKey}${count}`;
                     categorySelect.appendChild(opt);
                 }
+                applySelectedValues(categorySelect, pendingCategorySelection);
+                refreshSubcategoryOptions();
             }
         }
     } catch (e) {
@@ -3939,25 +4736,53 @@ async function loadCategories() {
     }
 }
 
+function refreshSubcategoryOptions() {
+    const selectedCategories = getSelectedValues(categorySelect);
+    const teachingInfo = categoriesTaxonomy.day_hoc;
+    const showSubjects = selectedCategories.includes("day_hoc") && teachingInfo?.sub;
+    if (groupSubcategory) groupSubcategory.style.display = showSubjects ? "block" : "none";
+    if (!subcategorySelect) return;
+
+    const previous = getSelectedValues(subcategorySelect).length > 0
+        ? getSelectedValues(subcategorySelect)
+        : pendingSubcategorySelection;
+    subcategorySelect.innerHTML = "";
+    if (showSubjects) {
+        for (const [subKey, subLabel] of Object.entries(teachingInfo.sub)) {
+            const opt = document.createElement("option");
+            opt.value = subKey;
+            const count = teachingInfo.sub_counts?.[subKey];
+            opt.innerText = `${subLabel}${count !== undefined ? ` · ${count}` : ""}`;
+            subcategorySelect.appendChild(opt);
+        }
+        applySelectedValues(subcategorySelect, previous);
+    }
+}
+
 if (categorySelect) {
     categorySelect.addEventListener("change", () => {
-        const catKey = categorySelect.value;
-        const catInfo = categoriesTaxonomy[catKey];
-        if (catInfo && catInfo.sub && Object.keys(catInfo.sub).length > 0) {
-            if (groupSubcategory) groupSubcategory.style.display = "block";
-            if (subcategorySelect) {
-                subcategorySelect.innerHTML = "";
-                for (const [subKey, subLabel] of Object.entries(catInfo.sub)) {
-                    const opt = document.createElement("option");
-                    opt.value = subKey;
-                    opt.innerText = subLabel;
-                    subcategorySelect.appendChild(opt);
-                }
-            }
-        } else {
-            if (groupSubcategory) groupSubcategory.style.display = "none";
-            if (subcategorySelect) subcategorySelect.innerHTML = '<option value="all">--- Tất cả ---</option>';
-        }
+        pendingCategorySelection = getSelectedValues(categorySelect);
+        refreshSubcategoryOptions();
+        saveControlPanelState();
+    });
+}
+
+if (subcategorySelect) {
+    subcategorySelect.addEventListener("change", () => {
+        pendingSubcategorySelection = getSelectedValues(subcategorySelect);
+        saveControlPanelState();
+    });
+}
+
+if (clearCategoryFilterBtn) {
+    clearCategoryFilterBtn.addEventListener("click", () => {
+        pendingCategorySelection = [];
+        pendingSubcategorySelection = [];
+        applySelectedValues(categorySelect, []);
+        applySelectedValues(subcategorySelect, []);
+        refreshSubcategoryOptions();
+        saveControlPanelState();
+        showToast("Đã xóa bộ lọc danh mục.", "info", 1500);
     });
 }
 
@@ -3994,3 +4819,706 @@ setTimeout(loadCategories, 400);
 
 
 
+
+
+// ==============================================================================
+// DRES LIVE CONTEST SUITE CONTROLLER (VÒNG CHUNG KẾT AIC 2026)
+// ==============================================================================
+const DRES_STATUS_URL = "http://localhost:8000/api/dres/status";
+const DRES_LOGIN_URL = "http://localhost:8000/api/dres/login";
+const DRES_REFRESH_URL = "http://localhost:8000/api/dres/refresh-eval";
+const DRES_SET_EVAL_URL = "http://localhost:8000/api/dres/set-evaluation";
+const DRES_SUBMIT_KIS_URL = "http://localhost:8000/api/dres/submit-kis";
+const DRES_SUBMIT_QA_URL = "http://localhost:8000/api/dres/submit-qa";
+const DRES_SUBMIT_TRAKE_URL = "http://localhost:8000/api/dres/submit-trake";
+
+async function parseDresApiResponse(response) {
+    const rawBody = await response.text();
+    let payload = null;
+    if (rawBody) {
+        try {
+            payload = JSON.parse(rawBody);
+        } catch {
+            payload = null;
+        }
+    }
+
+    if (!response.ok) {
+        const backendMessage = payload?.message || payload?.detail;
+        throw new Error(
+            backendMessage || `Backend DRES lỗi HTTP ${response.status}. Đây là lỗi kỹ thuật, chưa xác định đáp án đúng hay sai.`
+        );
+    }
+    if (!payload || typeof payload !== "object") {
+        throw new Error("Backend DRES trả dữ liệu không hợp lệ. Chưa xác định đáp án đúng hay sai.");
+    }
+    return payload;
+}
+const DRES_START_TASK_URL = "http://localhost:8000/api/dres/start-task";
+const DRES_RUN_ID_STORAGE_KEY = "aic_2026_dres_run_id";
+
+let dresState = {
+    isLoggedIn: false,
+    isConnected: false,
+    username: localStorage.getItem("dres_username") || "team_297",
+    serverUrl: localStorage.getItem("dres_server_url") || "https://eventretrieval.one",
+    evaluationName: "",
+    evaluationId: localStorage.getItem(DRES_RUN_ID_STORAGE_KEY) || "",
+    wrongCount: 0,
+    submittedKeys: new Set()
+};
+
+let pendingQaTarget = null; // { videoId, frameId, targetEl }
+
+// DOM elements
+const dresDot = document.getElementById("dres-dot");
+const dresStatusLabel = document.getElementById("dres-status-label");
+const dresEvalName = document.getElementById("dres-eval-name");
+const dresRefreshEvalBtn = document.getElementById("dres-refresh-eval-btn");
+const dresTaskModeSelect = document.getElementById("dres-task-mode-select");
+const dresHistoryToggleBtn = document.getElementById("dres-history-toggle-btn");
+const dresSubCount = document.getElementById("dres-sub-count");
+const dresSettingsBtn = document.getElementById("dres-settings-btn");
+const dresShortcutDesc = document.getElementById("dres-shortcut-desc");
+const dresModePills = document.querySelectorAll("#dres-mode-pills .btn-pill");
+
+const dresSettingsModal = document.getElementById("dres-settings-modal");
+const dresSettingsClose = document.getElementById("dres-settings-close");
+const dresInputServer = document.getElementById("dres-input-server");
+const dresInputUser = document.getElementById("dres-input-user");
+const dresInputPass = document.getElementById("dres-input-pass");
+const dresInputEvalId = document.getElementById("dres-input-eval-id");
+const dresCopyRunIdBtn = document.getElementById("dres-copy-run-id");
+const dresBtnSaveLogin = document.getElementById("dres-btn-save-login");
+let applyingSavedRunId = false;
+
+function isUuidLike(value) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || "").trim());
+}
+
+async function setDresRunId(runId, { persist = true, quiet = false } = {}) {
+    const cleanId = String(runId || "").trim();
+    if (!cleanId) return { status: "error", message: "Run ID không được để trống." };
+    if (!isUuidLike(cleanId)) return { status: "error", message: "Run ID không đúng định dạng UUID." };
+
+    const response = await fetch(DRES_SET_EVAL_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ evaluation_id: cleanId })
+    });
+    const data = await parseDresApiResponse(response);
+    if (data.status === "success") {
+        dresState.evaluationId = cleanId;
+        if (persist) localStorage.setItem(DRES_RUN_ID_STORAGE_KEY, cleanId);
+        if (!quiet) showToast(`Đã lưu Run ID ${cleanId.slice(0, 8)}…`, "success", 2200);
+    }
+    return data;
+}
+
+const dresHistoryModal = document.getElementById("dres-history-modal");
+const dresHistoryClose = document.getElementById("dres-history-close");
+const dresHistoryList = document.getElementById("dres-history-list");
+
+const dresQaModal = document.getElementById("dres-qa-modal");
+const dresQaClose = document.getElementById("dres-qa-close");
+const qaModalTarget = document.getElementById("qa-modal-target");
+const dresQaAnswerInput = document.getElementById("dres-qa-answer-input");
+const dresQaPreviewText = document.getElementById("dres-qa-preview-text");
+const dresQaSubmitBtn = document.getElementById("dres-qa-submit-btn");
+
+// HÀM ĐỒNG BỘ TOÀN DIỆN CHẾ ĐỘ THI ĐẤU (KIS / QA / TRAKE)
+function setDresSubmissionMode(mode) {
+    const m = (mode || "kis").toLowerCase();
+
+    // 1. Cập nhật select ẩn dresTaskModeSelect
+    if (dresTaskModeSelect) dresTaskModeSelect.value = m;
+
+    // 2. Cập nhật pills trên thanh DRES Live Bar
+    if (dresModePills) {
+        dresModePills.forEach(p => {
+            p.classList.toggle("active", p.dataset.mode === m);
+        });
+    }
+
+    // 3. Cập nhật pills trong Submission Manager (sidebar)
+    if (subModePills) {
+        subModePills.querySelectorAll(".btn-pill").forEach(p => {
+            p.classList.toggle("active", p.getAttribute("data-mode") === m);
+        });
+    }
+    if (typeof switchSubMode === "function") {
+        switchSubMode(m);
+    }
+
+    // Chỉ cập nhật hành vi NỘP DRES. Không đổi currentAppMode hoặc tab search.
+    if (dresShortcutDesc) {
+        if (m === "kis") {
+            dresShortcutDesc.innerText = "Ctrl + Click vào ảnh/timeline để Nộp 1-Click KIS";
+        } else if (m === "qa") {
+            dresShortcutDesc.innerText = "Ctrl + Click vào ảnh/timeline để Nhập & Nộp Q&A";
+        } else if (m === "trake") {
+            dresShortcutDesc.innerText = "Ctrl + Click vào ảnh để Mở Timeline & Chọn Chuỗi TRAKE";
+        }
+    }
+
+    // Cập nhật thanh chọn chuỗi nộp TRAKE nếu Timeline đang mở.
+    const trakeBar = document.getElementById("trake-timeline-bar");
+    if (trakeBar) {
+        trakeBar.style.display = (m === "trake") ? "flex" : "none";
+    }
+
+    // Video Player: chỉ submission TRAKE có nút nộp chuỗi riêng.
+    if (videoTrakeSubmitBtn) {
+        videoTrakeSubmitBtn.style.display = (m === "trake") ? "inline-flex" : "none";
+    }
+    if (videoModeHint) {
+        const modeHints = {
+            kis: { color: "#10b981", text: "KIS — Nộp ngay" },
+            qa: { color: "#38bdf8", text: "QA — Mở form đáp án" },
+            trake: { color: "#a855f7", text: "TRAKE — Thêm/bỏ sự kiện" }
+        };
+        const hint = modeHints[m] || modeHints.kis;
+        videoModeHint.style.color = hint.color;
+        videoModeHint.innerText = hint.text;
+    }
+    updateTrakeTimelineUi();
+
+    showToast(`🎯 Chế độ nộp DRES: ${m.toUpperCase()}`, "info", 1500);
+}
+window.setDresSubmissionMode = setDresSubmissionMode;
+
+// Chuyển đổi Mode Nộp DRES (KIS / QA / TRAKE)
+if (dresModePills && dresModePills.length > 0) {
+    dresModePills.forEach(pill => {
+        pill.addEventListener("click", () => {
+            const mode = pill.dataset.mode;
+            setDresSubmissionMode(mode);
+        });
+    });
+}
+
+async function fetchDresStatus() {
+    try {
+        const res = await fetch(DRES_STATUS_URL);
+        if (!res.ok) return;
+        const json = await res.json();
+        if (json.status === "success" && json.data) {
+            const d = json.data;
+            dresState.isLoggedIn = d.is_logged_in;
+            dresState.isConnected = d.is_connected;
+            dresState.username = d.username || dresState.username;
+            dresState.evaluationId = d.active_evaluation_id || "";
+            dresState.evaluationName = d.evaluation_name || "";
+            dresState.wrongCount = d.wrong_count || 0;
+
+            if (dresSubCount) dresSubCount.innerText = d.total_submitted || 0;
+
+            // Cập nhật giao diện Status
+            if (d.is_connected) {
+                if (dresDot) dresDot.className = "dres-dot pulse-green";
+                if (dresStatusLabel) dresStatusLabel.innerText = `DRES: ${d.username} (Online)`;
+                if (dresEvalName) {
+                    const shortRun = d.active_evaluation_id ? ` · ${d.active_evaluation_id.slice(0, 8)}…` : "";
+                    dresEvalName.innerText = d.evaluation_name ? `${d.evaluation_name}${shortRun}` : "Đang chờ Task...";
+                    dresEvalName.title = d.active_evaluation_id ? `Run ID: ${d.active_evaluation_id}` : "";
+                }
+            } else if (d.is_logged_in) {
+                if (dresDot) dresDot.className = "dres-dot pulse-green";
+                if (dresStatusLabel) dresStatusLabel.innerText = `DRES: ${d.username} (Chờ Eval)`;
+                if (dresEvalName) dresEvalName.innerText = "Chưa có Eval ACTIVE";
+            } else {
+                if (dresDot) dresDot.className = "dres-dot pulse-red";
+                if (dresStatusLabel) dresStatusLabel.innerText = "DRES: Chưa Đăng Nhập";
+                if (dresEvalName) dresEvalName.innerText = "Offline";
+            }
+
+            // Đồng bộ lịch sử nộp bài vào modal
+            if (d.history && dresHistoryList) {
+                renderDresHistory(d.history);
+            }
+
+            const savedRunId = localStorage.getItem(DRES_RUN_ID_STORAGE_KEY) || "";
+            if (d.is_logged_in && savedRunId && savedRunId !== d.active_evaluation_id && !applyingSavedRunId) {
+                applyingSavedRunId = true;
+                try {
+                    const applied = await setDresRunId(savedRunId, { persist: false, quiet: true });
+                    if (applied.status !== "success") {
+                        showToast(`Không thể khôi phục Run ID đã lưu: ${applied.message}`, "warning", 5000);
+                    }
+                } finally {
+                    applyingSavedRunId = false;
+                }
+            }
+        }
+    } catch (e) {
+        if (dresDot) dresDot.className = "dres-dot pulse-red";
+        if (dresStatusLabel) dresStatusLabel.innerText = "DRES: Mất kết nối Server Local";
+    }
+}
+
+function renderDresHistory(historyItems) {
+    if (!dresHistoryList) return;
+    if (!historyItems || historyItems.length === 0) {
+        dresHistoryList.innerHTML = `<div style="text-align: center; color: #94a3b8; padding: 20px;">Chưa có lần nộp bài nào trong câu này.</div>`;
+        return;
+    }
+
+    dresHistoryList.innerHTML = historyItems.map(item => {
+        const isCor = item.result === "CORRECT";
+        const isWr = item.result === "WRONG";
+        const cls = isCor ? "res-correct" : (isWr ? "res-wrong" : "");
+        const icon = isCor ? "🎉" : (isWr ? "❌" : "📤");
+        const detailStr = item.task_type === "KIS"
+            ? `${item.video_id} (${item.start_ms}ms)`
+            : (item.task_type === "QA" ? item.qa_text : item.trake_text);
+
+        return `
+            <div class="dres-history-item ${cls}">
+                <div>
+                    <span style="font-weight: 700; color: #38bdf8;">[${item.timestamp}] ${item.task_type}:</span>
+                    <span style="color: #f8fafc; margin-left: 6px;">${detailStr}</span>
+                </div>
+                <div style="font-weight: 700;">
+                    ${icon} ${item.result}
+                </div>
+            </div>
+        `;
+    }).join("");
+}
+
+// BỘ ĐIỀU PHỐI NỘP BÀI SIÊU TỐC (CTRL + CLICK HOẶC PHÍM TẮT)
+// Khi DRES offline, vẫn chạy trọn thao tác cục bộ để người dùng luyện/test UI.
+// Dry-run không ghi history, dedup hay trạng thái "đã nộp".
+function runDresOfflineDryRun(taskType, detail, targetEl = null) {
+    const normalizedTask = String(taskType || "KIS").toUpperCase();
+
+    if (targetEl?.tagName === "BUTTON") {
+        const originalText = targetEl.innerText;
+        targetEl.disabled = false;
+        targetEl.classList.remove("submitting");
+        targetEl.classList.add("dres-dry-run");
+        targetEl.innerText = `🧪 ${normalizedTask} DRY-RUN`;
+        window.setTimeout(() => {
+            targetEl.classList.remove("dres-dry-run");
+            if (!targetEl.classList.contains("submitted")) targetEl.innerText = originalText;
+        }, 1600);
+    } else if (targetEl?.classList) {
+        const dryRunClass = targetEl.classList.contains("timeline-item")
+            ? "timeline-dres-dry-run"
+            : "card-dres-dry-run";
+        targetEl.classList.add(dryRunClass);
+        window.setTimeout(() => targetEl.classList.remove(dryRunClass), 1600);
+    }
+
+    const suffix = detail ? ` (${detail})` : "";
+    showToast(
+        `🧪 Đã mô phỏng thao tác nộp ${normalizedTask}${suffix}. Cần đăng nhập DRES để gửi thật.`,
+        "warning",
+        3200
+    );
+}
+
+function openQaSubmissionModal(videoId, frameId, targetEl = null) {
+    pendingQaTarget = { videoId, frameId, targetEl };
+    if (qaModalTarget) qaModalTarget.innerText = `${videoId} / Frame: ${frameId}`;
+    if (dresQaAnswerInput) {
+        const existingAns = (typeof subQaAnswerInput !== "undefined" && subQaAnswerInput)
+            ? subQaAnswerInput.value.trim()
+            : "";
+        dresQaAnswerInput.value = existingAns;
+        updateQaPreview();
+    }
+    if (dresQaModal) dresQaModal.style.display = "flex";
+    setTimeout(() => dresQaAnswerInput?.focus(), 60);
+}
+
+function handleDresFastSubmit(videoId, frameId, targetEl = null) {
+    if (!videoId) {
+        showToast("⚠️ Không tìm thấy Video ID hợp lệ để nộp!", "warning");
+        return;
+    }
+
+    const currentMode = dresTaskModeSelect ? dresTaskModeSelect.value : "kis";
+
+    if (currentMode === "qa") {
+        openQaSubmissionModal(videoId, frameId, targetEl);
+        return;
+    }
+
+    if (currentMode === "trake") {
+        showToast(`⏱️ Đang mở Timeline video ${videoId} để chọn chuỗi TRAKE...`, "info", 1800);
+        openTimeline(videoId, frameId, true);
+        return;
+    }
+
+    // Chế độ KIS mặc định: 1-Click Submit
+    triggerDresSubmit(videoId, frameId, targetEl);
+}
+
+async function triggerDresSubmit(videoId, frameId, targetEl = null) {
+    if (!videoId) {
+        showToast("⚠️ Không tìm thấy Video ID hợp lệ để nộp!", "warning");
+        return;
+    }
+    if (!dresState.isLoggedIn) {
+        runDresOfflineDryRun("KIS", `${videoId} / KF ${frameId}`, targetEl);
+        return;
+    }
+
+    if (targetEl) {
+        if (targetEl.tagName === "BUTTON") {
+            targetEl.disabled = true;
+            targetEl.innerText = "⏳ Đang nộp...";
+            targetEl.classList.add("submitting");
+        } else if (targetEl.classList && targetEl.classList.contains("result-card")) {
+            targetEl.classList.add("card-dres-submitting");
+        }
+    }
+
+    try {
+        const res = await fetch(DRES_SUBMIT_KIS_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                video_id: videoId,
+                frame_id: frameId,
+                force: false
+            })
+        });
+
+        const data = await parseDresApiResponse(res);
+        handleSubmissionResponse(data, videoId, frameId, targetEl);
+    } catch (e) {
+        showToast(`Lỗi kỹ thuật khi nộp bài: ${e.message}`, "warning", 6000);
+        if (targetEl) {
+            if (targetEl.tagName === "BUTTON") {
+                targetEl.disabled = false;
+                targetEl.innerText = "🚀 NỘP DRES NGAY";
+                targetEl.classList.remove("submitting");
+            } else if (targetEl.classList) {
+                targetEl.classList.remove("card-dres-submitting");
+            }
+        }
+    }
+}
+
+async function triggerDresTrakeSubmit(videoId, frameIds, buttonEl = null) {
+    if (!videoId || !frameIds || frameIds.length < 2) {
+        showToast("⚠️ Cần chọn ít nhất 2 frame theo thứ tự thời gian để nộp TRAKE!", "warning");
+        return;
+    }
+    if (!dresState.isLoggedIn) {
+        runDresOfflineDryRun("TRAKE", `${videoId} / ${frameIds.length} sự kiện`, buttonEl);
+        return;
+    }
+
+    if (buttonEl) {
+        buttonEl.disabled = true;
+        buttonEl.innerText = "⏳ Đang nộp TRAKE...";
+    }
+
+    try {
+        const res = await fetch(DRES_SUBMIT_TRAKE_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                video_id: videoId,
+                frame_ids: frameIds,
+                force: false
+            })
+        });
+
+        const data = await parseDresApiResponse(res);
+        handleSubmissionResponse(data, videoId, frameIds.join(","), buttonEl);
+    } catch (e) {
+        showToast(`Lỗi kỹ thuật khi nộp TRAKE: ${e.message}`, "warning", 6000);
+        if (buttonEl) {
+            buttonEl.disabled = false;
+            buttonEl.innerText = "🚀 NỘP CHUỖI TRAKE";
+        }
+    }
+}
+
+function updateQaPreview() {
+    if (!dresQaPreviewText || !pendingQaTarget) return;
+    const ans = (dresQaAnswerInput ? dresQaAnswerInput.value.trim() : "") || "<ANSWER>";
+    dresQaPreviewText.innerText = `QA-${ans}-${pendingQaTarget.videoId}-<time_ms>`;
+}
+
+if (dresQaAnswerInput) {
+    dresQaAnswerInput.addEventListener("input", updateQaPreview);
+    dresQaAnswerInput.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") {
+            e.preventDefault();
+            if (dresQaModal) dresQaModal.style.display = "none";
+        } else if (e.key === "Enter") {
+            e.preventDefault();
+            triggerDresQaSubmit();
+        }
+    });
+}
+
+if (dresQaSubmitBtn) {
+    dresQaSubmitBtn.addEventListener("click", triggerDresQaSubmit);
+}
+
+if (dresQaModal) {
+    dresQaModal.addEventListener("click", (e) => {
+        if (e.target === dresQaModal) {
+            dresQaModal.style.display = "none";
+        }
+    });
+}
+
+if (dresQaClose && dresQaModal) {
+    dresQaClose.addEventListener("click", () => {
+        dresQaModal.style.display = "none";
+    });
+}
+
+async function triggerDresQaSubmit() {
+    if (!pendingQaTarget) return;
+    const ans = dresQaAnswerInput ? dresQaAnswerInput.value.trim() : "";
+    if (!ans) {
+        showToast("⚠️ Vui lòng nhập câu trả lời QA!", "warning");
+        return;
+    }
+    if (!dresState.isLoggedIn) {
+        const qaTarget = pendingQaTarget;
+        runDresOfflineDryRun("QA", `${qaTarget.videoId} / KF ${qaTarget.frameId}`, qaTarget.targetEl);
+        if (dresQaModal) dresQaModal.style.display = "none";
+        return;
+    }
+
+    if (dresQaSubmitBtn) {
+        dresQaSubmitBtn.disabled = true;
+        dresQaSubmitBtn.innerText = "⏳ Đang nộp...";
+    }
+
+    try {
+        const res = await fetch(DRES_SUBMIT_QA_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                video_id: pendingQaTarget.videoId,
+                frame_id: pendingQaTarget.frameId,
+                answer: ans,
+                force: false
+            })
+        });
+
+        const data = await parseDresApiResponse(res);
+        if (dresQaModal) dresQaModal.style.display = "none";
+        handleSubmissionResponse(data, pendingQaTarget.videoId, pendingQaTarget.frameId, pendingQaTarget.targetEl);
+    } catch (e) {
+        showToast(`Lỗi kỹ thuật khi gửi QA: ${e.message}`, "warning", 6000);
+    } finally {
+        if (dresQaSubmitBtn) {
+            dresQaSubmitBtn.disabled = false;
+            dresQaSubmitBtn.innerText = "🚀 NỘP Q&A NGAY";
+        }
+    }
+}
+
+function handleSubmissionResponse(data, videoId, frameId, targetEl = null) {
+    const key = `${videoId}_${frameId}`;
+
+    // Xóa trạng thái submitting trên toàn bộ cards
+    document.querySelectorAll(`.result-card[data-video-id="${videoId}"]`).forEach(card => {
+        card.classList.remove("card-dres-submitting");
+    });
+
+    if (data.status === "success") {
+        showToast(data.message, "success", 6000);
+        dresState.submittedKeys.add(key);
+
+        // Đánh dấu visual ĐÃ NỘP DRES trên các card phù hợp
+        document.querySelectorAll(`.result-card[data-video-id="${videoId}"]`).forEach(card => {
+            if (!card.dataset.frameId || card.dataset.frameId === String(frameId)) {
+                card.classList.add("card-dres-submitted");
+                const mediaBox = card.querySelector(".card-thumb-wrapper");
+                if (mediaBox && !mediaBox.querySelector(".card-submitted-badge")) {
+                    const badge = document.createElement("span");
+                    badge.className = "card-submitted-badge";
+                    badge.innerText = "✓ ĐÃ NỘP DRES";
+                    mediaBox.appendChild(badge);
+                }
+            }
+        });
+
+        if (targetEl && targetEl.tagName === "BUTTON") {
+            targetEl.innerText = "🎉 ĐÚNG! ĐÃ GHI ĐIỂM";
+            targetEl.classList.remove("submitting");
+            targetEl.classList.add("submitted");
+        } else if (targetEl && targetEl.classList && targetEl.classList.contains("timeline-item")) {
+            targetEl.style.outline = "2px solid #10b981";
+            targetEl.style.boxShadow = "0 0 14px #10b981";
+        }
+    } else if (data.status === "error") {
+        showToast(data.message, "error", 6000);
+        dresState.wrongCount = data.wrong_count || (dresState.wrongCount + 1);
+
+        if (targetEl && targetEl.tagName === "BUTTON") {
+            targetEl.disabled = false;
+            targetEl.innerText = "❌ Nộp Sai (-10đ)";
+            targetEl.classList.remove("submitting");
+            targetEl.classList.add("submitted");
+        } else if (targetEl && targetEl.classList && targetEl.classList.contains("timeline-item")) {
+            targetEl.style.outline = "2px solid #ef4444";
+            targetEl.style.boxShadow = "0 0 10px #ef4444";
+        }
+    } else if (data.status === "warning") {
+        showToast(data.message, "warning", 4500);
+        if (targetEl && targetEl.tagName === "BUTTON") {
+            targetEl.disabled = false;
+            targetEl.innerText = "⚠️ CẢNH BÁO DRES";
+            targetEl.classList.remove("submitting");
+        } else if (targetEl && targetEl.classList && targetEl.classList.contains("timeline-item")) {
+            targetEl.style.outline = "none";
+            targetEl.style.boxShadow = "none";
+        }
+    } else {
+        showToast(data.message, "info", 4500);
+        dresState.submittedKeys.add(key);
+        if (targetEl && targetEl.tagName === "BUTTON") {
+            targetEl.innerText = "✓ ĐÃ GỬI BÀI";
+            targetEl.classList.remove("submitting");
+            targetEl.classList.add("submitted");
+        } else if (targetEl && targetEl.classList && targetEl.classList.contains("timeline-item")) {
+            targetEl.style.outline = "2px solid #38bdf8";
+        }
+    }
+
+    fetchDresStatus();
+}
+
+function resetDresTask() {
+    dresState.submittedKeys.clear();
+    dresState.wrongCount = 0;
+    fetch(DRES_START_TASK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_duration_s: 300 })
+    }).then(() => {
+        showToast("🔄 Đã làm mới câu hỏi DRES!", "info", 2500);
+        document.querySelectorAll(".card-dres-submitted").forEach(c => c.classList.remove("card-dres-submitted"));
+        document.querySelectorAll(".card-submitted-badge").forEach(b => b.remove());
+        fetchDresStatus();
+    }).catch(e => console.warn(e));
+}
+if (dresRefreshEvalBtn) {
+    dresRefreshEvalBtn.addEventListener("click", async () => {
+        showToast("🔄 Đang làm mới danh sách đợt thi DRES...", "info", 1500);
+        try {
+            const res = await fetch(DRES_REFRESH_URL, { method: "POST" });
+            const d = await res.json();
+            showToast(d.message, d.status === "success" ? "success" : "info", 3000);
+            fetchDresStatus();
+        } catch (e) {
+            showToast(`Lỗi: ${e.message}`, "error", 2000);
+        }
+    });
+}
+
+// Modal Cấu hình DRES
+if (dresSettingsBtn && dresSettingsModal) {
+    dresSettingsBtn.addEventListener("click", () => {
+        dresSettingsModal.style.display = "flex";
+        if (dresInputUser) dresInputUser.value = dresState.username || "team_297";
+        if (dresInputServer) dresInputServer.value = dresState.serverUrl || "https://eventretrieval.one";
+        if (dresInputEvalId) dresInputEvalId.value = localStorage.getItem(DRES_RUN_ID_STORAGE_KEY) || dresState.evaluationId || "";
+        if (dresInputPass) dresInputPass.value = "";
+    });
+}
+if (dresSettingsClose && dresSettingsModal) {
+    dresSettingsClose.addEventListener("click", () => {
+        dresSettingsModal.style.display = "none";
+    });
+}
+if (dresBtnSaveLogin) {
+    dresBtnSaveLogin.addEventListener("click", async () => {
+        const user = dresInputUser ? dresInputUser.value.trim() : "";
+        const pass = dresInputPass ? dresInputPass.value.trim() : "";
+        const srv = dresInputServer ? dresInputServer.value.trim() : "";
+        const evalId = dresInputEvalId ? dresInputEvalId.value.trim() : "";
+
+        if (!user) {
+            showToast("Vui lòng nhập Username DRES.", "warning");
+            return;
+        }
+        if (evalId && !isUuidLike(evalId)) {
+            showToast("Run ID không đúng định dạng UUID.", "warning");
+            return;
+        }
+
+        dresBtnSaveLogin.disabled = true;
+        dresBtnSaveLogin.innerText = "⏳ Đang kết nối...";
+
+        try {
+            const res = await fetch(DRES_LOGIN_URL, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ username: user, password: pass || null, server_url: srv })
+            });
+            const d = await res.json();
+            if (d.status === "success") {
+                showToast(d.message, "success", 4000);
+                localStorage.setItem("dres_username", user);
+                localStorage.setItem("dres_server_url", srv);
+                dresState.username = user;
+                dresState.serverUrl = srv;
+                if (evalId) {
+                    const evalResult = await setDresRunId(evalId, { persist: true, quiet: true });
+                    if (evalResult.status !== "success") {
+                        showToast(evalResult.message, "warning", 5000);
+                        return;
+                    }
+                }
+                if (dresSettingsModal) dresSettingsModal.style.display = "none";
+                fetchDresStatus();
+            } else {
+                showToast(`❌ ${d.message}`, "error", 5000);
+            }
+        } catch (e) {
+            showToast(`Lỗi: ${e.message}`, "error", 4000);
+        } finally {
+            dresBtnSaveLogin.disabled = false;
+            dresBtnSaveLogin.innerText = "💾 LƯU & ĐĂNG NHẬP NGAY";
+        }
+    });
+}
+
+if (dresCopyRunIdBtn) {
+    dresCopyRunIdBtn.addEventListener("click", async () => {
+        const runId = dresInputEvalId?.value.trim() || dresState.evaluationId;
+        if (!runId) {
+            showToast("Chưa có Run ID để copy.", "warning", 1800);
+            return;
+        }
+        await navigator.clipboard.writeText(runId);
+        showToast("Đã copy Run ID.", "success", 1500);
+    });
+}
+
+// Modal Lịch sử nộp bài
+if (dresHistoryToggleBtn && dresHistoryModal) {
+    dresHistoryToggleBtn.addEventListener("click", () => {
+        dresHistoryModal.style.display = "flex";
+        fetchDresStatus();
+    });
+}
+if (dresHistoryClose && dresHistoryModal) {
+    dresHistoryClose.addEventListener("click", () => {
+        dresHistoryModal.style.display = "none";
+    });
+}
+
+// Khởi tạo DRES polling
+setSearchControlsReady(false);
+fetchSystemReadiness();
+readinessPollTimer = setInterval(fetchSystemReadiness, 750);
+
+setTimeout(() => {
+    fetchDresStatus();
+    setInterval(fetchDresStatus, 5000);
+}, 600);

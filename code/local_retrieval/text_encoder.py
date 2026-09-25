@@ -20,6 +20,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Tiền tố Task Instruction chính thức từ bài báo Qwen3-VL-Embedding
 OFFICIAL_INSTRUCT_PROMPT = "Instruct: Given a search query, retrieve relevant images\nQuery: "
+OFFICIAL_SPEECH_INSTRUCT_PROMPT = "Instruct: Given a search query, retrieve relevant speech transcripts\nQuery: "
 
 # ==============================================================================
 # CINEMATOGRAPHY & CAMERA MOTION DICTIONARY (CHIẾN LƯỢC 1: TỐI ƯU GÓC QUAY)
@@ -128,6 +129,51 @@ class TextEncoder:
         vec = self._model.encode(
             [text],
             prompt=self.instruct_prompt,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
+        return vec[0].astype(np.float32)
+
+    def encode_documents(
+        self,
+        texts: Union[str, List[str]],
+        batch_size: int = 64,
+        show_progress_bar: bool = False
+    ) -> np.ndarray:
+        """
+        Mã hóa tài liệu / văn bản ASR / OCR ở phía Document-Side:
+        - Không áp dụng Instruct Prefix của Query.
+        - Không áp dụng Cinematography Enrichment.
+        - Tuân thủ chuẩn bài báo Qwen3-VL: prompt_name="document" (chuỗi rỗng "").
+        - Trả về numpy array float32 đã được L2-normalize.
+        """
+        self._load()
+        is_single = isinstance(texts, str)
+        input_texts = [texts] if is_single else list(texts)
+
+        vecs = self._model.encode(
+            input_texts,
+            prompt_name="document",
+            batch_size=batch_size,
+            show_progress_bar=show_progress_bar,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        ).astype(np.float32)
+
+        return vecs[0] if is_single else vecs
+
+    def encode_query_for_speech(self, text: str) -> np.ndarray:
+        """
+        Mã hóa truy vấn tìm kiếm giọng nói / lời thoại ASR ở phía Query-Side:
+        - Áp dụng Instruct Prefix chuyên biệt cho bài toán Speech Retrieval.
+        - Tắt Cinematography Enrichment (tránh làm lệch ngữ nghĩa lời thoại).
+        - Trả về numpy array 1D shape (2048,) đã được L2-normalize.
+        """
+        self._load()
+        clean_text = str(text).strip() if text else ""
+        vec = self._model.encode(
+            [clean_text],
+            prompt=OFFICIAL_SPEECH_INSTRUCT_PROMPT,
             convert_to_numpy=True,
             normalize_embeddings=True
         )

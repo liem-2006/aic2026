@@ -12,6 +12,8 @@ import os
 import re
 import json
 import time
+import bisect
+import csv
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Union
 
@@ -71,16 +73,24 @@ class VideoSearchEngine:
             import lancedb
             print(f"[SearchEngine] Đang nạp LanceDB Vector Database từ: {config.LANCEDB_PATH}...")
             self.lancedb_client = lancedb.connect(config.LANCEDB_PATH)
-            self.lancedb_table = self.lancedb_client.open_table("keyframes")
-            
+            kf_tbl_name = getattr(config, "KEYFRAME_TABLE_NAME", "keyframes_k1r")
             existing_tables = []
             try:
-                existing_tables = self.lancedb_client.table_names()
+                existing_tables = self.lancedb_client.table_names() if hasattr(self.lancedb_client, "table_names") else self.lancedb_client.list_tables()
             except Exception:
                 try:
                     existing_tables = self.lancedb_client.list_tables().tables
                 except Exception:
                     existing_tables = []
+
+            if kf_tbl_name in existing_tables:
+                self.lancedb_table = self.lancedb_client.open_table(kf_tbl_name)
+            elif "keyframes" in existing_tables:
+                kf_tbl_name = "keyframes"
+                self.lancedb_table = self.lancedb_client.open_table("keyframes")
+            else:
+                kf_tbl_name = existing_tables[0]
+                self.lancedb_table = self.lancedb_client.open_table(kf_tbl_name)
 
             if "keyframes_beit3" in existing_tables:
                 self.beit3_table = self.lancedb_client.open_table("keyframes_beit3")
@@ -93,7 +103,7 @@ class VideoSearchEngine:
                 print(f"[SearchEngine] ✅ Nạp bảng '{shot_tbl_name}': {len(self.shot_table):,} items.")
 
             self.d = config.EMBEDDING_DIM
-            print(f"[SearchEngine] ✅ LanceDB Engine nạp xong | Bảng 'keyframes': {len(self.lancedb_table):,} items.")
+            print(f"[SearchEngine] ✅ LanceDB Engine nạp xong | Bảng '{kf_tbl_name}': {len(self.lancedb_table):,} items.")
 
             # Nạp mmap ma trận embedding Qwen (0 MB RAM) để Cross-Scoring siêu tốc
             self.qwen_mmap = None
@@ -123,12 +133,8 @@ class VideoSearchEngine:
         self.asr_engine = get_asr_engine()
         self.asr_engine.load()
 
-        # 4. Nạp RT-DETR Index (57 MB)
+        # RT-DETR đã ngừng dùng. Không đọc index/metadata cũ dù còn trên đĩa.
         self.rtdetr_index = None
-        if os.path.exists(config.RTDETR_INDEX_PATH):
-            print(f"[SearchEngine] Đang nạp RT-DETR Index (57 MB)...")
-            self.rtdetr_index = np.load(config.RTDETR_INDEX_PATH)  # shape (358639, 80), float16
-            print(f"[SearchEngine] ✅ RT-DETR Index (80 COCO classes) nạp xong.")
 
         # 5. Metadata Bounding Boxes (Nạp Lazy khi cần)
         self.rtdetr_metadata: Optional[Dict[str, Any]] = None
@@ -139,6 +145,13 @@ class VideoSearchEngine:
             with open(config.FPS_MAPPING_PATH, "r", encoding="utf-8") as f:
                 self.fps_mapping = json.load(f)
             print(f"[SearchEngine] ✅ Đã nạp FPS Mapping cho {len(self.fps_mapping):,} videos.")
+
+        # Cache nho cho luong mo nhanh/nop ho. Chi tao entry khi video duoc tra
+        # cuu, khong nhan ban toan bo mapping keyframe trong RAM khi khoi dong.
+        self._video_keyframe_ids_cache: Dict[str, List[int]] = {}
+        self._actual_video_fps_cache: Dict[str, Optional[float]] = {}
+        self._actual_video_frame_count_cache: Dict[str, Optional[int]] = {}
+        self._frame_pts_cache: Dict[str, Dict[int, float]] = {}
 
         # 7. Video Shot Mappings (Tra cứu O(1) KF <-> Shot)
         self.kf_shot_map: Dict[str, str] = {}
@@ -161,60 +174,253 @@ class VideoSearchEngine:
             except Exception as e:
                 print(f"[SearchEngine] ⚠️ Lỗi đọc shot_meta_map: {e}")
 
+        self.shot_best_active_kf: Dict[str, str] = {}
+        shot_distance: Dict[str, int] = {}
+        for path in self.mapping:
+            shot_id = self.kf_shot_map.get(path)
+            if not shot_id or shot_id not in self.shot_meta_map:
+                continue
+            try:
+                frame = int(path.split("/", 1)[1].split(".", 1)[0])
+            except ValueError:
+                continue
+            distance = abs(frame - int(self.shot_meta_map[shot_id].get("anchor_frame_id") or 0))
+            if distance < shot_distance.get(shot_id, 1 << 60):
+                shot_distance[shot_id] = distance
+                self.shot_best_active_kf[shot_id] = path
+
+        self.caption_engine = None  # Lazy: no RAM cost when Caption switch is off.
+
         print(f"[SearchEngine] ✅ Khởi tạo xong trong {time.time() - t0:.2f}s | {len(self.mapping):,} frames sẵn sàng")
 
     def get_video_fps(self, video_id: str) -> float:
         """Lấy FPS thực tế của video, mặc định 25.0 nếu không tìm thấy."""
-        clean_vid = video_id.strip()
+        clean_vid = config.normalize_video_id(video_id)
         return float(self.fps_mapping.get(clean_vid, 25.0))
 
-    def _ensure_metadata_loaded(self):
-        """Nạp RT-DETR Bounding Box Metadata vào bộ nhớ nếu chưa nạp."""
-        if self.rtdetr_metadata is None:
-            if os.path.exists(config.RTDETR_METADATA_PATH):
-                t_load = time.time()
-                print("[SearchEngine] Đang nạp RT-DETR Metadata Bounding Boxes (420 MB)...")
-                with open(config.RTDETR_METADATA_PATH, "r", encoding="utf-8") as f:
-                    self.rtdetr_metadata = json.load(f)
-                print(f"[SearchEngine] ✅ Nạp xong {len(self.rtdetr_metadata):,} entries Bounding Boxes trong {time.time() - t_load:.2f}s.")
+    def _exact_video_token(self, value: str) -> bool:
+        return value in self.video_categories or bool(re.fullmatch(r"[LMNS]\d{2,3}[-_]V\d{3}", value))
+
+    def frame_timestamp(self, video_id: str, frame_id: int) -> float:
+        """Use embedding CSV PTS for batch 2, including VFR MOV traffic clips."""
+        video_id = config.normalize_video_id(video_id)
+        if video_id.startswith(("M", "N", "S")):
+            if video_id not in self._frame_pts_cache:
+                csv_path = os.path.join(config.BATCH2_DIR, "map-keyframes-k1r", video_id + ".csv")
+                with open(csv_path, newline="", encoding="utf-8-sig") as source:
+                    self._frame_pts_cache[video_id] = {
+                        int(row["frame_idx"]): float(row["pts_time"]) for row in csv.DictReader(source)
+                    }
+            if frame_id in self._frame_pts_cache[video_id]:
+                return self._frame_pts_cache[video_id][frame_id]
+        return frame_id / self.get_video_fps(video_id)
+
+    def _get_video_keyframe_ids(self, video_id: str) -> List[int]:
+        """Tra danh sach frame ID that trong keyframe map, co lazy cache theo video."""
+        clean_vid = config.normalize_video_id(video_id)
+        if clean_vid in self._video_keyframe_ids_cache:
+            return self._video_keyframe_ids_cache[clean_vid]
+
+        prefix = f"{clean_vid}/"
+        frame_ids: List[int] = []
+        for path in self.mapping:
+            if not path.startswith(prefix):
+                continue
+            try:
+                frame_ids.append(int(path.split("/", 1)[1].rsplit(".", 1)[0]))
+            except (ValueError, IndexError):
+                continue
+        frame_ids.sort()
+        self._video_keyframe_ids_cache[clean_vid] = frame_ids
+        return frame_ids
+
+    def _get_actual_video_fps(self, video_id: str) -> Optional[float]:
+        """Doc FPS tu MP4 bang PyAV neu san co; loi probe khong lam hong retrieval."""
+        clean_vid = config.normalize_video_id(video_id)
+        if clean_vid in self._actual_video_fps_cache:
+            return self._actual_video_fps_cache[clean_vid]
+
+        actual_fps: Optional[float] = None
+        video_path = config.video_file(clean_vid)
+        if os.path.exists(video_path):
+            try:
+                import av
+                with av.open(video_path) as container:
+                    stream = container.streams.video[0]
+                    if stream.average_rate:
+                        candidate = float(stream.average_rate)
+                        if candidate > 0:
+                            actual_fps = candidate
+                    self._actual_video_frame_count_cache[clean_vid] = int(stream.frames) if stream.frames else None
+            except Exception as exc:
+                print(f"[SearchEngine] ⚠️ Không probe được FPS MP4 {clean_vid}: {exc}")
+
+        self._actual_video_fps_cache[clean_vid] = actual_fps
+        if clean_vid not in self._actual_video_frame_count_cache:
+            self._actual_video_frame_count_cache[clean_vid] = None
+        return actual_fps
+
+    def resolve_keyframe(self, video_id: str, frame_id: Optional[Union[int, str]] = None) -> Dict[str, Any]:
+        """Đối chiếu frame người dùng nhập với keyframe map và FPS của video gốc."""
+        clean_vid = config.normalize_video_id(video_id)
+        video_path = config.video_file(clean_vid)
+        frame_ids = self._get_video_keyframe_ids(clean_vid)
+        mapped_fps = self.get_video_fps(clean_vid)
+        actual_fps = self._get_actual_video_fps(clean_vid)
+        video_frame_count = self._actual_video_frame_count_cache.get(clean_vid)
+
+        requested: Optional[int] = None
+        if frame_id is not None and str(frame_id).strip() != "":
+            try:
+                requested = max(0, int(str(frame_id).strip()))
+            except (TypeError, ValueError):
+                return {
+                    "status": "error",
+                    "message": "Keyframe ID phải là số nguyên không âm.",
+                    "video_id": clean_vid,
+                }
+
+        resolved: Optional[int] = None
+        exact_match = False
+        if requested is not None and frame_ids:
+            idx = bisect.bisect_left(frame_ids, requested)
+            if idx < len(frame_ids) and frame_ids[idx] == requested:
+                resolved = requested
+                exact_match = True
+            elif idx == 0:
+                resolved = frame_ids[0]
+            elif idx >= len(frame_ids):
+                resolved = frame_ids[-1]
             else:
-                self.rtdetr_metadata = {}
+                before = frame_ids[idx - 1]
+                after = frame_ids[idx]
+                resolved = before if requested - before <= after - requested else after
+        elif requested is not None:
+            # Video van co the mo duoc du khong nam trong keyframe map K1R.
+            resolved = requested
+
+        timestamp_sec = self.frame_timestamp(clean_vid, resolved) if resolved is not None else 0.0
+        fps_delta = abs(mapped_fps - actual_fps) if actual_fps is not None else None
+        requested_in_video_range = bool(
+            requested is None
+            or video_frame_count is None
+            or 0 <= requested < video_frame_count
+        )
+        return {
+            "status": "success",
+            "video_id": clean_vid,
+            "video_file_exists": os.path.exists(video_path),
+            "keyframe_map_exists": bool(frame_ids),
+            "keyframe_count": len(frame_ids),
+            "requested_frame_id": f"{requested:06d}" if requested is not None else None,
+            "resolved_frame_id": f"{resolved:06d}" if resolved is not None else None,
+            "exact_match": exact_match,
+            "frame_delta": (resolved - requested) if resolved is not None and requested is not None else 0,
+            "timestamp_sec": round(timestamp_sec, 6),
+            "mapped_fps": round(mapped_fps, 6),
+            "actual_video_fps": round(actual_fps, 6) if actual_fps is not None else None,
+            "video_frame_count": video_frame_count,
+            "requested_in_video_range": requested_in_video_range,
+            "fps_mismatch": bool(fps_delta is not None and fps_delta > 0.01),
+        }
+
+    def _get_candidate_vector(self, candidate: Dict[str, Any]) -> Tuple[Optional[np.ndarray], float]:
+        """Lấy vector candidate thống nhất cho cả LanceDB và USearch fallback."""
+        vector = candidate.get("vector")
+        if vector is None:
+            idx = int(candidate.get("idx", -1))
+            qwen_mmap = getattr(self, "qwen_mmap", None)
+            if qwen_mmap is not None and 0 <= idx < len(qwen_mmap):
+                vector = qwen_mmap[idx]
+            elif self.features is not None and 0 <= idx < len(self.features):
+                vector = self.features[idx]
+
+        if vector is None:
+            return None, 1.0
+
+        norm = candidate.get("vec_norm")
+        if norm is None or float(norm) <= 0:
+            norm = float(np.linalg.norm(vector))
+        return vector, max(float(norm), 1e-12)
+
+    def _candidate_cosine(self, left: Dict[str, Any], right: Dict[str, Any]) -> float:
+        """Cosine similarity dùng chung cho mọi nhánh deduplication."""
+        left_vec, left_norm = self._get_candidate_vector(left)
+        right_vec, right_norm = self._get_candidate_vector(right)
+        if left_vec is None or right_vec is None:
+            return 0.0
+        return float(np.dot(left_vec, right_vec)) / (left_norm * right_norm)
+
+    @staticmethod
+    def _normalize_taxonomy_values(value: Union[str, List[str], None]) -> List[str]:
+        """Chuẩn hóa bộ lọc taxonomy cũ (string) và mới (list), chỉ nhận slug an toàn."""
+        raw_values = value if isinstance(value, list) else [value]
+        normalized: List[str] = []
+        for raw in raw_values:
+            item = str(raw or "").strip().lower()
+            if not item or item == "all" or not re.fullmatch(r"[a-z0-9_]+", item):
+                continue
+            if item not in normalized:
+                normalized.append(item)
+        return normalized
+
+    def _build_taxonomy_mask(
+        self,
+        category: Union[str, List[str], None],
+        sub_category: Union[str, List[str], None],
+    ) -> Optional[np.ndarray]:
+        """Tạo mask: OR giữa category; môn học chỉ giới hạn category day_hoc."""
+        categories = self._normalize_taxonomy_values(category)
+        subjects = self._normalize_taxonomy_values(sub_category)
+        if not categories and not subjects:
+            return None
+
+        mask = np.zeros(len(self.mapping), dtype=bool)
+        non_teaching = [item for item in categories if item != "day_hoc"]
+        if non_teaching:
+            mask |= np.isin(self.categories, non_teaching)
+
+        include_teaching = "day_hoc" in categories or (not categories and bool(subjects))
+        if include_teaching:
+            teaching_mask = self.categories == "day_hoc"
+            if subjects:
+                teaching_mask &= np.isin(self.sub_categories, subjects)
+            mask |= teaching_mask
+        return mask
+
+    def _build_taxonomy_sql(
+        self,
+        category: Union[str, List[str], None],
+        sub_category: Union[str, List[str], None],
+    ) -> str:
+        """Sinh cùng một biểu thức taxonomy cho LanceDB keyframe và video_shots."""
+        categories = self._normalize_taxonomy_values(category)
+        subjects = self._normalize_taxonomy_values(sub_category)
+        if not categories and not subjects:
+            return ""
+
+        branches: List[str] = []
+        non_teaching = [item for item in categories if item != "day_hoc"]
+        if non_teaching:
+            values = ", ".join(f"'{item}'" for item in non_teaching)
+            branches.append(f"category IN ({values})")
+
+        include_teaching = "day_hoc" in categories or (not categories and bool(subjects))
+        if include_teaching:
+            teaching = "category = 'day_hoc'"
+            if subjects:
+                values = ", ".join(f"'{item}'" for item in subjects)
+                teaching += f" AND sub_category IN ({values})"
+            branches.append(f"({teaching})")
+        return " OR ".join(branches)
+
+    def _ensure_metadata_loaded(self):
+        """Legacy no-op: object metadata is disabled for both batches."""
+        self.rtdetr_metadata = {}
 
     def get_boxes_for_keyframe(self, video_id: str, frame_id: str, raw_boxes_json: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Lấy danh sách bounding boxes của 1 keyframe cụ thể."""
-        if raw_boxes_json:
-            try:
-                raw_boxes = json.loads(raw_boxes_json)
-            except Exception:
-                raw_boxes = []
-        else:
-            self._ensure_metadata_loaded()
-            if not self.rtdetr_metadata:
-                return []
-            
-            clean_vid = str(video_id).strip()
-            clean_fid = f"{int(frame_id):06d}" if str(frame_id).strip().isdigit() else str(frame_id).strip().replace(".jpg", "")
-            
-            # Format trong rtdetr_metadata.json là "{video_id}_{frame_id}" (Ví dụ: "L21_V001_000410")
-            raw_boxes = (
-                self.rtdetr_metadata.get(f"{clean_vid}_{clean_fid}")
-                or self.rtdetr_metadata.get(f"{clean_vid}/{clean_fid}.jpg")
-                or self.rtdetr_metadata.get(f"{clean_vid}_{clean_fid}.jpg")
-                or self.rtdetr_metadata.get(f"{clean_vid}/{clean_fid}")
-                or []
-            )
-
-        formatted = []
-        for b in raw_boxes:
-            cid = b.get("class_id", -1)
-            cname = config.COCO_CLASSES[cid] if 0 <= cid < len(config.COCO_CLASSES) else f"cls_{cid}"
-            formatted.append({
-                "class_id": cid,
-                "class_name": cname,
-                "confidence": round(float(b.get("confidence", 0.0)), 3),
-                "box": [round(float(coord), 1) for coord in b.get("box", [])]
-            })
-        return formatted
+        """Legacy compatibility endpoint; RT-DETR is disabled."""
+        return []
 
     def get_keyframes_for_video(self, video_id: str) -> List[Dict[str, Any]]:
         """
@@ -243,7 +449,7 @@ class VideoSearchEngine:
             f_id = parts[1].replace(".jpg", "")
             fps = self.get_video_fps(v_id)
             try:
-                sec = int(f_id) / fps
+                sec = self.frame_timestamp(v_id, int(f_id))
             except ValueError:
                 sec = 0.0
 
@@ -253,7 +459,7 @@ class VideoSearchEngine:
             asr_prev = sp_exp.get("prev_text", "")
             asr_next = sp_exp.get("next_text", "")
             asr_all = sp_exp.get("all_context", "")
-            boxes = self.get_boxes_for_keyframe(v_id, f_id)
+            boxes = []
 
             timeline_frames.append({
                 "video_id": v_id,
@@ -276,8 +482,8 @@ class VideoSearchEngine:
         top_k: int = 200,
         effective_include: Optional[List[str]] = None,
         effective_exclude: Optional[List[str]] = None,
-        category: str = "",
-        sub_category: str = ""
+        category: Union[str, List[str]] = "",
+        sub_category: Union[str, List[str]] = ""
     ) -> List[Dict[str, Any]]:
         """Truy vấn trực tiếp trên bảng video_shots (LanceDB) với bộ lọc pushdown."""
         if self.shot_table is None or query_vec is None:
@@ -289,8 +495,8 @@ class VideoSearchEngine:
             where_clauses = []
 
             if effective_include:
-                exact_inc = [v for v in effective_include if "_" in v]
-                prefix_inc = [v for v in effective_include if "_" not in v]
+                exact_inc = [v for v in effective_include if self._exact_video_token(v)]
+                prefix_inc = [v for v in effective_include if not self._exact_video_token(v)]
                 inc_parts = []
                 if exact_inc:
                     v_str = ", ".join([f"'{v}'" for v in exact_inc])
@@ -301,24 +507,29 @@ class VideoSearchEngine:
                     where_clauses.append(" OR ".join(inc_parts))
 
             if effective_exclude:
-                exact_exc = [v for v in effective_exclude if "_" in v]
-                prefix_exc = [v for v in effective_exclude if "_" not in v]
+                exact_exc = [v for v in effective_exclude if self._exact_video_token(v)]
+                prefix_exc = [v for v in effective_exclude if not self._exact_video_token(v)]
                 for v in exact_exc:
                     where_clauses.append(f"video_id != '{v}'")
                 for pfx in prefix_exc:
                     where_clauses.append(f"NOT (video_id LIKE '{pfx}%')")
 
-            if category and category.strip() and category != "all":
-                where_clauses.append(f"category = '{category.strip()}'")
-            if sub_category and sub_category.strip() and sub_category != "all":
-                where_clauses.append(f"sub_category = '{sub_category.strip()}'")
+            category_clause = self._build_taxonomy_sql(category, sub_category)
+            if category_clause:
+                where_clauses.append(category_clause)
 
             if where_clauses:
                 full_where = " AND ".join([f"({c})" for c in where_clauses])
                 q_builder = q_builder.where(full_where)
 
-            df = q_builder.metric("cosine").limit(top_k).to_pandas()
-            return df.to_dict("records")
+            # Shot vector 2048D chi can cho viec xep hang ben trong LanceDB;
+            # khong dua no sang Python vi downstream chi dung shot_id va rank.
+            return (
+                q_builder.metric("cosine")
+                .select(["shot_id", "_distance"])
+                .limit(top_k)
+                .to_list()
+            )
         except Exception as e:
             print(f"[SearchEngine] ⚠️ Lỗi tìm kiếm video_shots: {e}")
             return []
@@ -338,8 +549,8 @@ class VideoSearchEngine:
         video_id: str = "",
         include_videos: Optional[List[str]] = None,
         exclude_videos: Optional[List[str]] = None,
-        category: str = "",
-        sub_category: str = "",
+        category: Union[str, List[str]] = "",
+        sub_category: Union[str, List[str]] = "",
         weight_visual: float = 1.0,
         weight_ocr: float = 1.0,
         weight_asr: float = 1.0,
@@ -354,6 +565,7 @@ class VideoSearchEngine:
         rrf_use_visual: bool = True,       # Tín hiệu KF Visual tham gia RRF
         rrf_use_asr: bool = True,          # Tín hiệu ASR tham gia RRF
         rrf_use_shot: bool = True,         # Tín hiệu Video Shot tham gia RRF
+        rrf_use_caption: bool = False,     # Caption lexical của một phần shot batch 1
         return_shots: bool = False,        # Trả về cả {results, shot_results}
         **kwargs
     ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
@@ -401,7 +613,7 @@ class VideoSearchEngine:
         if effective_include:
             inc_mask = np.zeros(len(self.mapping), dtype=bool)
             for item in effective_include:
-                if "_" in item:
+                if self._exact_video_token(item):
                     inc_mask |= (self.video_ids == item)
                 else:
                     inc_mask |= np.char.startswith(self.video_ids, item)
@@ -410,17 +622,16 @@ class VideoSearchEngine:
         if effective_exclude:
             exc_mask = np.zeros(len(self.mapping), dtype=bool)
             for item in effective_exclude:
-                if "_" in item:
+                if self._exact_video_token(item):
                     exc_mask |= (self.video_ids == item)
                 else:
                     exc_mask |= np.char.startswith(self.video_ids, item)
             valid_mask &= ~exc_mask
 
-        # Lọc theo Danh mục (Category) & Môn học (Sub-category)
-        if category and category.strip() and category != "all":
-            valid_mask &= (self.categories == category.strip())
-        if sub_category and sub_category.strip() and sub_category != "all":
-            valid_mask &= (self.sub_categories == sub_category.strip())
+        # Nhiều category/subcategory dùng OR. Môn học chỉ giới hạn nhánh day_hoc.
+        taxonomy_mask = self._build_taxonomy_mask(category, sub_category)
+        if taxonomy_mask is not None:
+            valid_mask &= taxonomy_mask
 
         # Lọc theo Object Confidence Threshold
         if has_object and object_conf_thresh > 0:
@@ -472,8 +683,8 @@ class VideoSearchEngine:
 
                     # 1. Multi-video include filter (hỗ trợ cả exact ID và prefix)
                     if effective_include:
-                        exact_inc = [v for v in effective_include if "_" in v]
-                        prefix_inc = [v for v in effective_include if "_" not in v]
+                        exact_inc = [v for v in effective_include if self._exact_video_token(v)]
+                        prefix_inc = [v for v in effective_include if not self._exact_video_token(v)]
                         inc_parts = []
                         if exact_inc:
                             v_str = ", ".join([f"'{v}'" for v in exact_inc])
@@ -485,26 +696,28 @@ class VideoSearchEngine:
 
                     # 2. Multi-video exclude filter (hỗ trợ cả exact ID và prefix)
                     if effective_exclude:
-                        exact_exc = [v for v in effective_exclude if "_" in v]
-                        prefix_exc = [v for v in effective_exclude if "_" not in v]
+                        exact_exc = [v for v in effective_exclude if self._exact_video_token(v)]
+                        prefix_exc = [v for v in effective_exclude if not self._exact_video_token(v)]
                         if exact_exc:
                             ex_str = ", ".join([f"'{v}'" for v in exact_exc])
                             where_clauses.append(f"video_id NOT IN ({ex_str})")
                         for pfx in prefix_exc:
                             where_clauses.append(f"video_id NOT LIKE '{pfx}%'")
 
-                    # 3. Category filter
-                    if category and category.strip() and category != "all":
-                        where_clauses.append(f"category = '{category.strip()}'")
-
-                    # 4. Sub-category filter (Môn học)
-                    if sub_category and sub_category.strip() and sub_category != "all":
-                        where_clauses.append(f"sub_category = '{sub_category.strip()}'")
+                    # 3. Taxonomy filter: OR category, subcategory chỉ áp dụng day_hoc.
+                    category_clause = self._build_taxonomy_sql(category, sub_category)
+                    if category_clause:
+                        where_clauses.append(category_clause)
 
                     if where_clauses:
                         sql_where = " AND ".join([f"({c})" for c in where_clauses])
                         q_builder = q_builder.where(sql_where, prefilter=True)
                     
+                    # Khi mmap Qwen san sang, dedup/cross-score co the doc vector
+                    # theo idx. Chi project metadata can thiet de tranh cap phat
+                    # hang nghin vector 2048D cho moi lan search/refine.
+                    if self.qwen_mmap is not None:
+                        q_builder = q_builder.select(["id", "_distance"])
                     hits = q_builder.limit(search_k).to_list()
                     for hit in hits:
                         kf_path = hit["id"]
@@ -514,8 +727,9 @@ class VideoSearchEngine:
                             sim = max(0.0, 1.0 - dist)
                             v_raw = hit.get("vector")
                             v_arr = np.array(v_raw, dtype=np.float32) if v_raw is not None else None
-                            v_norm = float(np.linalg.norm(v_arr)) if v_arr is not None else 1.0
-                            if v_norm == 0: v_norm = 1.0
+                            v_norm = float(np.linalg.norm(v_arr)) if v_arr is not None else None
+                            if v_norm == 0:
+                                v_norm = 1.0
                             
                             obj_scs = hit.get("obj_scores", [])
                             obj_score = float(obj_scs[object_class_id]) if (has_object and 0 <= object_class_id < len(obj_scs)) else 0.0
@@ -560,7 +774,7 @@ class VideoSearchEngine:
             # 1. Semantic Search qua Qwen3-VL Vector Embedding trên LanceDB asr_segments (nếu bảng có sẵn)
             if hasattr(self.asr_engine, "asr_table") and self.asr_engine.asr_table is not None:
                 encoder = get_text_encoder()
-                asr_vec = encoder.encode(effective_speech)
+                asr_vec = encoder.encode_query_for_speech(effective_speech)
                 sem_results = self.asr_engine.search_semantic(
                     query_vector=asr_vec,
                     video_id=video_id.strip() if video_id else "",
@@ -607,6 +821,31 @@ class VideoSearchEngine:
                             "speech_start": item["speech_start"],
                             "speech_end": item["speech_end"]
                         }
+
+        # Caption can introduce its own candidates, not only rerank visual Top-K.
+        caption_rank_by_shot: Dict[str, int] = {}
+        if use_rrf and rrf_use_caption and (query_text or speech_query):
+            if self.caption_engine is None:
+                try:
+                    from .caption_engine import CaptionEngine
+                except ImportError:
+                    from caption_engine import CaptionEngine
+                self.caption_engine = CaptionEngine()
+            caption_query = query_text.strip() or speech_query.strip()
+            for result in self.caption_engine.search(caption_query, max(top_k * 15, 1000)):
+                caption_rank_by_shot[result["shot_id"]] = result["rank"]
+                kf_path = result["keyframe"]
+                idx = self.path_to_idx.get(kf_path)
+                if idx is None or not valid_mask[idx]:
+                    continue
+                if kf_path not in frame_candidates:
+                    frame_candidates[kf_path] = {
+                        "path": kf_path, "idx": idx, "score_visual": 0.0,
+                        "score_ocr": 0.0, "score_asr": 0.0, "score_obj": 0.0,
+                        "speech_text": "", "speech_start": 0.0, "speech_end": 0.0,
+                    }
+                frame_candidates[kf_path]["rank_caption"] = result["rank"]
+                frame_candidates[kf_path]["score_caption"] = result["score"]
 
         # Nếu chỉ tìm theo Object
         if not has_visual and not has_ocr and not has_speech and has_object:
@@ -678,11 +917,6 @@ class VideoSearchEngine:
                 for r_idx, c in enumerate(asr_cands):
                     c["rank_asr"] = r_idx + 1
 
-            if has_object:
-                obj_cands = sorted([c for c in candidates_list if c["score_obj"] > 0], key=lambda x: x["score_obj"], reverse=True)
-                for r_idx, c in enumerate(obj_cands):
-                    c["rank_obj"] = r_idx + 1
-
             # Bảng tra thứ hạng Video Shot (nếu bật rrf_use_shot)
             shot_rank_map = {}
             if rrf_use_shot and shot_cands:
@@ -691,34 +925,32 @@ class VideoSearchEngine:
 
             raw_rrf_scores = []
             for cand in candidates_list:
-                score = 0.0
-                if "rank_vis" in cand and has_visual and rrf_use_visual:
-                    score += 1.0 / (k_val + cand["rank_vis"])
-                if "rank_ocr" in cand and has_ocr:
-                    score += 1.0 / (k_val + cand["rank_ocr"])
-                if "rank_asr" in cand and has_speech and rrf_use_asr:
-                    score += 1.0 / (k_val + cand["rank_asr"])
-                if "rank_obj" in cand and has_object:
-                    score += 1.0 / (k_val + cand["rank_obj"])
-
-                # Điểm đóng góp từ Video Shot
+                # Availability khác hit: channel có dữ liệu nhưng không vào
+                # retrieval list vẫn nằm trong mẫu số và đóng góp 0.
+                channels = []
+                if has_visual and rrf_use_visual:
+                    channels.append("rank_vis")
+                if has_ocr:
+                    channels.append("rank_ocr")
+                if has_speech and rrf_use_asr and cand["path"] in self.asr_engine.kf_to_speech:
+                    channels.append("rank_asr")
                 if rrf_use_shot and shot_rank_map:
                     cand_shot_id = self.kf_shot_map.get(cand["path"])
                     if not cand_shot_id:
                         p_parts = cand["path"].split("/")
                         cand_shot_id = self.kf_shot_map.get(f"{p_parts[0]}/{p_parts[1].replace('.jpg','')}")
+                    if cand_shot_id in self.shot_meta_map:
+                        channels.append("rank_shot")
                     if cand_shot_id and cand_shot_id in shot_rank_map:
-                        score += 1.0 / (k_val + shot_rank_map[cand_shot_id])
                         cand["rank_shot"] = shot_rank_map[cand_shot_id]
-
-                # Bonus cộng điểm cho frame khớp nhiều kênh đồng thời
-                match_channels = (1 if cand["score_visual"] > 0.15 else 0) + \
-                                 (1 if cand["score_asr"] > 0.15 else 0) + \
-                                 (1 if cand["score_obj"] > 0.3 else 0) + \
-                                 (1 if "rank_shot" in cand else 0)
-                if match_channels >= 2:
-                    score *= 1.25
-
+                if rrf_use_caption and self.caption_engine and self.caption_engine.available:
+                    cand_shot_id = self.kf_shot_map.get(cand["path"])
+                    if cand_shot_id in self.caption_engine.shot_ids:
+                        channels.append("rank_caption")
+                        if cand_shot_id in caption_rank_by_shot:
+                            cand["rank_caption"] = caption_rank_by_shot[cand_shot_id]
+                score = sum((k_val + 1) / (k_val + cand[key]) for key in channels if key in cand)
+                score /= max(1, len(channels))
                 cand["raw_rrf"] = score
                 raw_rrf_scores.append(score)
 
@@ -778,15 +1010,7 @@ class VideoSearchEngine:
                 if enable_cross_video_dedup and accepted_records:
                     is_cross_dup = False
                     for acc_rec in accepted_records:
-                        cand_vec = cand.get("vector")
-                        acc_vec = acc_rec.get("vector")
-                        if cand_vec is not None and acc_vec is not None:
-                            vec_sim = float(np.dot(cand_vec, acc_vec)) / (cand.get("vec_norm", 1.0) * acc_rec.get("vec_norm", 1.0))
-                        elif self.features is not None:
-                            raw_dot = float(np.dot(self.features[cand_idx], self.features[acc_rec["idx"]]))
-                            vec_sim = raw_dot / (self.feature_norms[cand_idx] * self.feature_norms[acc_rec["idx"]])
-                        else:
-                            vec_sim = 0.0
+                        vec_sim = self._candidate_cosine(cand, acc_rec)
 
                         if vec_sim >= cross_video_sim_thresh:
                             is_cross_dup = True
@@ -818,7 +1042,7 @@ class VideoSearchEngine:
                 cand_fps = self.get_video_fps(cand_vid)
                 try:
                     cand_frame_num = int(cand_frame_str)
-                    cand_sec = cand_frame_num / cand_fps
+                    cand_sec = self.frame_timestamp(cand_vid, cand_frame_num)
                 except ValueError:
                     cand_sec = 0.0
 
@@ -829,15 +1053,7 @@ class VideoSearchEngine:
                 for acc_rec in accepted_records:
                     acc_idx = acc_rec["idx"]
                     # 1. So sánh vector thị giác chuẩn Cosine Similarity
-                    cand_vec = cand.get("vector")
-                    acc_vec = acc_rec.get("vector")
-                    if cand_vec is not None and acc_vec is not None:
-                        vec_sim = float(np.dot(cand_vec, acc_vec)) / (cand.get("vec_norm", 1.0) * acc_rec.get("vec_norm", 1.0))
-                    elif self.features is not None:
-                        raw_dot = float(np.dot(self.features[cand_idx], self.features[acc_idx]))
-                        vec_sim = raw_dot / (self.feature_norms[cand_idx] * self.feature_norms[acc_idx])
-                    else:
-                        vec_sim = 0.0
+                    vec_sim = self._candidate_cosine(cand, acc_rec)
 
                     # 2. Khử trùng thị giác liên video (Cross-Video Dedup chống spam quảng cáo/intro)
                     if cand_vid != acc_rec["video_id"]:
@@ -891,12 +1107,12 @@ class VideoSearchEngine:
             # Trích xuất mốc giây
             fps = self.get_video_fps(v_id)
             try:
-                frame_sec = int(f_id) / fps
+                frame_sec = self.frame_timestamp(v_id, int(f_id))
             except ValueError:
                 frame_sec = 0.0
 
             # Lấy danh sách Bounding Boxes từ metadata
-            boxes = self.get_boxes_for_keyframe(v_id, f_id, raw_boxes_json=r.get("boxes_json"))
+            boxes = []
 
             # Lấy thông tin lời thoại thực tế của keyframe kèm ngữ cảnh mở rộng (±asr_window_n segments)
             sp_exp = self.asr_engine.get_speech_for_keyframe_expanded(r["path"], window_n=asr_window_n)
@@ -927,7 +1143,7 @@ class VideoSearchEngine:
                 "asr_transcript": transcript,
                 "asr_prev": asr_prev,
                 "asr_next": asr_next,
-                "asr_all": sp_exp.get("all_text", transcript),
+                "asr_all": sp_exp.get("all_context", transcript),
                 "asr_start": asr_st,
                 "asr_end": asr_et,
                 "boxes": boxes,
@@ -942,6 +1158,9 @@ class VideoSearchEngine:
                 "rank_vis": r.get("rank_vis"),
                 "rank_asr": r.get("rank_asr"),
                 "rank_shot": r.get("rank_shot"),
+                "rank_caption": r.get("rank_caption"),
+                "caption_score": r.get("score_caption", 0.0),
+                "caption_available": bool(self.caption_engine and cand_shot_id in self.caption_engine.shot_ids),
                 "rank_ocr": r.get("rank_ocr"),
                 "rank_obj": r.get("rank_obj")
             })
@@ -995,9 +1214,10 @@ class VideoSearchEngine:
                     b_kf_path = b_kf.get("path", "")
                     b_kf_frame_id = b_kf_path.split("/")[1].replace(".jpg", "") if "/" in b_kf_path else ""
                 else:
-                    anchor = meta.get("anchor_frame_id", 0)
-                    b_kf_frame_id = str(anchor).zfill(6)
-                    b_kf_path = f"{v_id}/{b_kf_frame_id}.jpg"
+                    b_kf_path = self.shot_best_active_kf.get(s_id, "")
+                    b_kf_frame_id = b_kf_path.split("/", 1)[1].replace(".jpg", "") if b_kf_path else ""
+                if not b_kf_path:
+                    continue
 
                 cut_file = meta.get("cut_file", "")
                 norm_score = round(raw_s_score / max_s_score, 4)
@@ -1055,12 +1275,14 @@ class VideoSearchEngine:
         video_id: str = "",
         include_videos: Optional[List[str]] = None,
         exclude_videos: Optional[List[str]] = None,
-        category: str = "",
-        sub_category: str = "",
+        category: Union[str, List[str]] = "",
+        sub_category: Union[str, List[str]] = "",
         rrf_use_visual: bool = True,
         rrf_use_asr: bool = True,
         rrf_use_shot: bool = True,
-        return_shots: bool = True
+        rrf_use_caption: bool = False,
+        return_shots: bool = True,
+        compact_response: bool = False
     ) -> Dict[str, Any]:
         """
         Truy vấn Đa Phân Cảnh (Multi-Scene / TRAKE Temporal Query Decomposition & Video Voting).
@@ -1083,14 +1305,45 @@ class VideoSearchEngine:
         scene_outputs = []
         video_scene_scores: Dict[str, Dict[int, float]] = {}
 
-        # Tôn trọng kích thước Candidate Pool (top_k) do người dùng thiết lập
-        effective_top_k = max(top_k, 10)
-        effective_top_v = max(top_v, trake_top_k if trake_mode else top_v, 1)
+        # Tôn trọng đúng hai tham số độc lập:
+        # - top_v: số video được quét sâu (chi phối trực tiếp độ trễ)
+        # - trake_top_k: số chuỗi tối đa trả ra, không được âm thầm nâng top_v
+        effective_top_k = max(int(top_k), 10)
+        requested_top_v = max(int(top_v), 1)
+        requested_k_per_video = max(int(k_per_video), 1)
+        effective_top_v = min(requested_top_v, int(getattr(config, "TRAKE_MAX_TOP_V", 50)))
+        effective_k_per_video = min(
+            requested_k_per_video,
+            int(getattr(config, "TRAKE_MAX_FRAMES_PER_VIDEO", 150))
+        )
+        effective_k_paths = max(int(k_paths), 1)
+        max_sequence_capacity = effective_top_v * (effective_k_paths if trake_mode else 1)
+        effective_trake_top_k = min(max(int(trake_top_k), 1), max_sequence_capacity)
+
+        print(
+            "[SearchEngine][MultiScene] "
+            f"Bắt đầu | scenes={num_scenes} | pool={effective_top_k} | "
+            f"top_v={effective_top_v} | k_per_video={effective_k_per_video} | "
+            f"k_paths={effective_k_paths} | output_top_k={effective_trake_top_k}"
+        )
+        if requested_top_v != effective_top_v or requested_k_per_video != effective_k_per_video:
+            print(
+                "[SearchEngine][TRAKE] ⚠️ Cấu hình vượt guardrail; "
+                f"top_v {requested_top_v}->{effective_top_v}, "
+                f"k_per_video {requested_k_per_video}->{effective_k_per_video}."
+            )
+        if trake_mode and int(trake_top_k) > max_sequence_capacity:
+            print(
+                "[SearchEngine][TRAKE] ⚠️ Top Sequences vượt khả năng hiện tại; "
+                f"giới hạn {int(trake_top_k)} -> {effective_trake_top_k} "
+                f"(Top V {effective_top_v} × K-paths {effective_k_paths})."
+            )
 
         encoder = get_text_encoder()
         scene_query_vecs = []
 
         # 1. Quét độc lập từng phân cảnh S_i với toàn bộ thiết lập động hiện tại
+        stage1_started = time.time()
         for s_idx, sc in enumerate(scenes):
             sc_vis = sc.get("visual_query", "").strip() if enable_visual else ""
             sc_ocr = sc.get("ocr_query", "").strip() if enable_ocr else ""
@@ -1138,7 +1391,10 @@ class VideoSearchEngine:
                 rrf_use_visual=rrf_use_visual,
                 rrf_use_asr=rrf_use_asr,
                 rrf_use_shot=rrf_use_shot,
-                return_shots=return_shots
+                rrf_use_caption=rrf_use_caption,
+                # TRAKE chỉ dùng shot rank để fusion và ánh xạ lại bằng kf_shot_map;
+                # không cần format/trả hàng trăm shot trung gian cho từng event.
+                return_shots=return_shots and not trake_mode
             )
 
             if isinstance(search_out, dict):
@@ -1163,6 +1419,8 @@ class VideoSearchEngine:
                     video_scene_scores[vid] = {}
                 video_scene_scores[vid][s_idx] = max(video_scene_scores[vid].get(s_idx, 0.0), float(r["score"]))
 
+        stage1_elapsed = time.time() - stage1_started
+
         # 2. Giao thoa Video & Video Voting
         video_joint_scores: Dict[str, float] = {}
         for vid, s_dict in video_scene_scores.items():
@@ -1182,6 +1440,8 @@ class VideoSearchEngine:
         top_videos = sorted(video_joint_scores.keys(), key=lambda v: video_joint_scores[v], reverse=True)[:effective_top_v]
 
         # 3. Trích xuất frames chi tiết cho từng video trong Top N theo từng phân cảnh
+        refine_started = time.time()
+        refine_search_calls = 0
         refined_scenes_results = []
         all_combined_frames = []
 
@@ -1197,11 +1457,14 @@ class VideoSearchEngine:
 
             sc_frames_for_top_videos = []
             for vid in top_videos:
+                refine_search_calls += 1
                 vid_res = self.search(
                     query_text=sc_vis,
                     ocr_query=sc_ocr,
                     speech_query=sc_asr,
-                    enable_asr=enable_asr,
+                    # Khong chay ngam ASR neu kenh nay khong tham gia RRF.
+                    # Weighted mode van ton trong enable_asr cua nguoi dung.
+                    enable_asr=enable_asr and (not use_rrf or rrf_use_asr),
                     object_class_id=sc_obj_id if enable_object else None,
                     object_conf_thresh=sc_obj_thresh if enable_object else 0.0,
                     video_id=vid,
@@ -1209,14 +1472,20 @@ class VideoSearchEngine:
                     weight_ocr=weight_ocr,
                     weight_asr=weight_asr,
                     weight_object=weight_object if enable_object else 0.0,
-                    top_k=k_per_video,
+                    top_k=effective_k_per_video,
                     dedup_mode=dedup_mode,
                     visual_sim_thresh=visual_sim_thresh,
                     enable_cross_video_dedup=enable_cross_video_dedup,
                     cross_video_sim_thresh=cross_video_sim_thresh,
                     use_rrf=use_rrf,
                     rrf_k=rrf_k,
-                    query_vec=sc_vec
+                    asr_window_n=asr_window_n,
+                    query_vec=sc_vec,
+                    rrf_use_visual=rrf_use_visual,
+                    rrf_use_asr=rrf_use_asr,
+                    rrf_use_shot=rrf_use_shot,
+                    rrf_use_caption=rrf_use_caption,
+                    return_shots=False
                 )
                 for item in vid_res:
                     item["scene_idx"] = sc.get("scene_idx", s_idx + 1)
@@ -1234,7 +1503,10 @@ class VideoSearchEngine:
             })
             all_combined_frames.extend(sc_frames_for_top_videos)
 
+        refine_elapsed = time.time() - refine_started
+
         # 4. Xây dựng Chuỗi Storyboard Ghép Cảnh theo Video bằng TARS Monotonic DP
+        dp_started = time.time()
         storyboard_sequences = []
         trake_submission_lines = []
 
@@ -1301,6 +1573,7 @@ class VideoSearchEngine:
                 })
 
         storyboard_sequences.sort(key=lambda x: x["joint_score"], reverse=True)
+        dp_elapsed = time.time() - dp_started
 
         # Cập nhật lại rank sau khi sort
         for r_idx, seq in enumerate(storyboard_sequences):
@@ -1319,14 +1592,21 @@ class VideoSearchEngine:
         unique_combined.sort(key=lambda x: x["score"], reverse=True)
 
         elapsed = round(time.time() - t0, 3)
-        print(f"[SearchEngine] ⏱️ Đa phân cảnh (TRAKE={trake_mode}) hoàn tất trong {elapsed}s | Top videos: {top_videos[:5]} | {len(storyboard_sequences)} storyboard rows | {len(unique_combined)} frames.")
+        print(
+            f"[SearchEngine] ⏱️ Đa phân cảnh (TRAKE={trake_mode}) hoàn tất trong {elapsed}s | "
+            f"Stage1={stage1_elapsed:.3f}s | Refine={refine_elapsed:.3f}s/{refine_search_calls} calls | "
+            f"DP={dp_elapsed:.3f}s | Top videos={len(top_videos)} {top_videos[:5]} | "
+            f"{len(storyboard_sequences)} storyboard rows | {len(unique_combined)} frames."
+        )
 
         return {
             "top_videos": top_videos,
-            "storyboard_sequences": storyboard_sequences[:trake_top_k if trake_mode else len(storyboard_sequences)],
-            "trake_submission_lines": trake_submission_lines[:trake_top_k if trake_mode else 100],
-            "scenes_results": refined_scenes_results,
-            "combined_results": unique_combined,
+            "storyboard_sequences": storyboard_sequences[:effective_trake_top_k if trake_mode else len(storyboard_sequences)],
+            "trake_submission_lines": trake_submission_lines[:effective_trake_top_k if trake_mode else 100],
+            # UI TRAKE chi render storyboard. Khong serialize them hang nghin
+            # frame trung gian khi client yeu cau response gon.
+            "scenes_results": [] if (trake_mode and compact_response) else refined_scenes_results,
+            "combined_results": [] if (trake_mode and compact_response) else unique_combined,
             "total_candidates": len(unique_combined),
             "elapsed_sec": elapsed
         }
@@ -1347,8 +1627,8 @@ class VideoSearchEngine:
         video_id: str = "",
         include_videos: Optional[List[str]] = None,
         exclude_videos: Optional[List[str]] = None,
-        category: str = "",
-        sub_category: str = "",
+        category: Union[str, List[str]] = "",
+        sub_category: Union[str, List[str]] = "",
         weight_visual: float = 1.0,
         weight_ocr: float = 1.0,
         weight_asr: float = 1.0,
@@ -1443,42 +1723,73 @@ class VideoSearchEngine:
             sim_score = float(f["score"])
             dp[0].append([(sim_score, -1)])  # list of best paths ending at (0, j)
 
-        # Tiến hành DP với Prefix-Max và Lambda Penalty
-        for s in range(1, num_s):
-            curr_frames = vid_scenes_frames[s]
-            prev_frames = vid_scenes_frames[s - 1]
-            dp[s] = [[] for _ in range(len(curr_frames))]
+        # K-path=1 la cau hinh thi dau pho bien. Recurrence co the tach thanh:
+        # max(prev_score + lambda * prev_t) + curr_score - lambda * curr_t.
+        # Frame da sort theo timestamp, nen prefix maximum dua O(M^2) ve O(M).
+        if k_paths == 1:
+            for s in range(1, num_s):
+                curr_frames = vid_scenes_frames[s]
+                prev_frames = vid_scenes_frames[s - 1]
+                dp[s] = [[] for _ in range(len(curr_frames))]
+                prev_cursor = 0
+                best_adjusted = float("-inf")
+                best_prev_idx = -1
 
-            for j, curr_f in enumerate(curr_frames):
-                curr_sim = float(curr_f["score"])
-                curr_t = curr_f["timestamp_sec"]
+                for j, curr_f in enumerate(curr_frames):
+                    curr_sim = float(curr_f["score"])
+                    curr_t = curr_f["timestamp_sec"]
 
-                # Tìm các bước chuyển hợp lệ từ scene s-1 thỏa mãn t_prev < t_curr
-                candidate_transitions = []
-                for k, prev_f in enumerate(prev_frames):
-                    prev_t = prev_f["timestamp_sec"]
-                    if curr_t > prev_t:
-                        # Tính penalty theo khoảng cách thời gian giữa 2 sự kiện
-                        delta_t = curr_t - prev_t
-                        penalty = lambda_penalty * delta_t
-                        
-                        for prev_path_score, _ in dp[s - 1][k]:
-                            trans_score = prev_path_score + curr_sim - penalty
-                            candidate_transitions.append((trans_score, k))
+                    while prev_cursor < len(prev_frames) and prev_frames[prev_cursor]["timestamp_sec"] < curr_t:
+                        if dp[s - 1][prev_cursor]:
+                            prev_score = dp[s - 1][prev_cursor][0][0]
+                            adjusted = prev_score + lambda_penalty * prev_frames[prev_cursor]["timestamp_sec"]
+                            # Dau bang giu frame xuat hien truoc, giong stable sort cu.
+                            if adjusted > best_adjusted:
+                                best_adjusted = adjusted
+                                best_prev_idx = prev_cursor
+                        prev_cursor += 1
 
-                if candidate_transitions:
-                    # Sắp xếp lấy top transitions cho vị trí (s, j)
-                    candidate_transitions.sort(key=lambda x: x[0], reverse=True)
-                    dp[s][j] = candidate_transitions[:k_paths]
-                else:
-                    # Nếu không có frame nào trước đó có t < curr_t -> Fallback không ràng buộc thời gian
+                    if best_prev_idx >= 0:
+                        score = best_adjusted + curr_sim - lambda_penalty * curr_t
+                        dp[s][j] = [(score, best_prev_idx)]
+                    else:
+                        # Giu nguyen fallback cu khi khong co moc truoc hop le.
+                        fallback = []
+                        for k, _prev_f in enumerate(prev_frames):
+                            if dp[s - 1][k]:
+                                prev_score = dp[s - 1][k][0][0]
+                                fallback.append((prev_score + curr_sim * 0.5 - 0.2, k))
+                        if fallback:
+                            fallback.sort(key=lambda x: x[0], reverse=True)
+                            dp[s][j] = fallback[:1]
+        else:
+            # K-path>1 giu transition cu de bao toan cach sinh path da dang.
+            for s in range(1, num_s):
+                curr_frames = vid_scenes_frames[s]
+                prev_frames = vid_scenes_frames[s - 1]
+                dp[s] = [[] for _ in range(len(curr_frames))]
+
+                for j, curr_f in enumerate(curr_frames):
+                    curr_sim = float(curr_f["score"])
+                    curr_t = curr_f["timestamp_sec"]
+                    candidate_transitions = []
                     for k, prev_f in enumerate(prev_frames):
-                        for prev_path_score, _ in dp[s - 1][k]:
-                            trans_score = prev_path_score + curr_sim * 0.5 - 0.2  # Phạt nặng vì sai thứ tự
-                            candidate_transitions.append((trans_score, k))
+                        prev_t = prev_f["timestamp_sec"]
+                        if curr_t > prev_t:
+                            penalty = lambda_penalty * (curr_t - prev_t)
+                            for prev_path_score, _ in dp[s - 1][k]:
+                                candidate_transitions.append((prev_path_score + curr_sim - penalty, k))
+
                     if candidate_transitions:
                         candidate_transitions.sort(key=lambda x: x[0], reverse=True)
-                        dp[s][j] = candidate_transitions[:1]
+                        dp[s][j] = candidate_transitions[:k_paths]
+                    else:
+                        for k, _prev_f in enumerate(prev_frames):
+                            for prev_path_score, _ in dp[s - 1][k]:
+                                candidate_transitions.append((prev_path_score + curr_sim * 0.5 - 0.2, k))
+                        if candidate_transitions:
+                            candidate_transitions.sort(key=lambda x: x[0], reverse=True)
+                            dp[s][j] = candidate_transitions[:1]
 
         # Thu thập tất cả các endpoint ở Scene cuối cùng
         last_scene_candidates = []

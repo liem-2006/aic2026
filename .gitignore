@@ -5,6 +5,8 @@
 .env.local
 *.key
 *.pem
+*dres_config*.json
+*dres_session*.json
 
 # ==============================================================================
 # DỮ LIỆU NẶNG (Data, Keyframes, Videos, Vector Indices, LanceDB)
@@ -17,6 +19,10 @@
 *.tar
 *.zip
 *.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
 *.jpg
 *.jpeg
 *.png
