@@ -74,6 +74,7 @@ logs/
 .tempmediaStorage/
 .system_generated/
 scratch/
+metadata_mappings_copy/
 
 # ==============================================================================
 # OS SPECIFIC FILES & TEMPORARY CLONES
