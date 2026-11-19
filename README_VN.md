@@ -1,3 +1,19 @@
+## Phạm vi bản công khai
+
+Repository giữ hệ thống thi Chung kết (mốc `ce72210` trước khi lọc lịch sử),
+gồm runtime, công cụ thiết lập dữ liệu và kiểm tra hữu ích. Không bao gồm mã
+đánh giá bài báo, notebook cá nhân, benchmark nháp, dữ liệu hoặc model weights.
+Hai nhánh `main` và `competition-final` cùng trỏ tới bản thi đã làm sạch.
+
+Sau khi tạo `code/local_retrieval/venv` và cài `requirements.txt`, bật kiểm tra
+trước commit bằng `git config core.hooksPath .githooks`. Xem [SECURITY.md](SECURITY.md).
+Chạy `python -m unittest discover -s tests` để kiểm tra bảo mật offline.
+File `code/local_retrieval/test_batch2_integration.py` là smoke test cần dữ liệu
+index gốc; không phải test API key. Các script normalize/integrate/replace
+embedding thay đổi dữ liệu local, cần đọc hướng dẫn và có backup trước khi chạy;
+không cần chạy lại mỗi lần khởi động. Encoder BEiT3 độc lập cần thêm `torchscale`
+và weights riêng; cấu hình Qwen mặc định không cần thành phần này.
+
 <div align="center">
 
 # 🎬 AIC 2026: Hệ Thống Truy Vấn Video Đa Phương Thức & Tìm Kiếm Tương Tác

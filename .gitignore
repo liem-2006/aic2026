@@ -3,6 +3,11 @@
 # ==============================================================================
 .env
 .env.local
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.jks
 *.key
 *.pem
 *dres_config*.json
@@ -74,6 +79,21 @@ logs/
 .tempmediaStorage/
 .system_generated/
 scratch/
+/tmp/
+/artifacts/
+/output/
+/poster/
+/write-soict/
+/code/paper_analysis/
+/code/local_retrieval/evaluation/
+/code/local_retrieval/quick_ocr_search.py
+/code/kaggle/
+/code/vastai/
+/code/slamander/
+/.agents/
+/.codex/
+/.aws/
+*.bundle
 metadata_mappings_copy/
 
 # ==============================================================================

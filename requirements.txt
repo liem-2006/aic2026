@@ -25,6 +25,9 @@ Pillow>=10.0.0
 av>=10.0.0
 numpy>=1.24.0
 scipy>=1.11.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+requests>=2.31.0
 
 # AI Query Assistant (Google Gemini)
 google-generativeai>=0.8.0

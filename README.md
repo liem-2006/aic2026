@@ -14,6 +14,23 @@
 
 </div>
 
+## Public release scope
+
+This repository preserves the Final Round system (the former `ce72210` baseline),
+with runtime, data setup utilities and useful checks. Paper evaluation code,
+personal notebooks, benchmark scratch scripts and datasets are not distributed.
+`main` and `competition-final` identify the cleaned competition release.
+
+Create `code/local_retrieval/venv`, install `requirements.txt`, then enable the
+credential guard with `git config core.hooksPath .githooks`. See [SECURITY.md](SECURITY.md).
+Run `python -m unittest discover -s tests` for offline security checks.
+`code/local_retrieval/test_batch2_integration.py` is a separate, data-dependent
+smoke check for the original integrated index; it is not a scratch API-key test.
+Normalization/integration and embedding replacement scripts modify local data:
+read their usage and retain backups before running them. They are not startup steps.
+The optional standalone BEiT3 encoder also requires `torchscale` and its model
+weights; it is not needed by the default Qwen setup.
+
 ---
 
 ## 🌟 Highlights

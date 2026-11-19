@@ -1,0 +1,18 @@
+name: Repository checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m venv code/local_retrieval/venv
+      - run: code/local_retrieval/venv/bin/python tools/check_secrets.py --history
+      - run: code/local_retrieval/venv/bin/python -m unittest discover -s tests
